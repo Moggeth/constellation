@@ -110,6 +110,13 @@ Notes on archive root:
 - `fast` (default): sampled content fingerprint (size + sampled bytes from start/middle/end) for much faster duplicate checks.
 - `strict`: full-file SHA-256 (slower, highest confidence).
 
+## Interrupt/disconnect safety
+
+- Source reads now fail gracefully if a USB device disconnects mid-run.
+- Audio copies are written to a temporary `.part` file and atomically renamed only when complete.
+- Transcript, manifest, and monthly aggregate files are written atomically to avoid partial/corrupted outputs.
+- If disconnect happens mid-ingest, already completed items remain intact and the rest can be resumed on reconnect.
+
 ## Output structure
 
 ```text

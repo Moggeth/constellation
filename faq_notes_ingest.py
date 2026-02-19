@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import errno
 import hashlib
 import json
 import math
@@ -79,6 +80,10 @@ class Device:
     path: Path
 
 
+class SourceUnavailableError(RuntimeError):
+    """Raised when the currently selected source device disappears mid-run."""
+
+
 def default_worker_count() -> int:
     return max(2, min(4, os.cpu_count() or 2))
 
@@ -95,6 +100,81 @@ def run_checked(cmd: list[str], capture_output: bool = True) -> subprocess.Compl
         capture_output=capture_output,
         text=True,
     )
+
+
+def atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(content, encoding=encoding)
+    tmp_path.replace(path)
+
+
+def is_disconnect_error(exc: OSError) -> bool:
+    disconnect_errnos = {
+        errno.ENODEV,
+        errno.EIO,
+        errno.ENXIO,
+        getattr(errno, "ESTALE", errno.EIO),
+    }
+    disconnect_winerrors = {
+        21,    # ERROR_NOT_READY
+        64,    # ERROR_NETNAME_DELETED
+        1117,  # ERROR_IO_DEVICE
+        1167,  # ERROR_DEVICE_NOT_CONNECTED
+    }
+    if getattr(exc, "errno", None) in disconnect_errnos:
+        return True
+    if getattr(exc, "winerror", None) in disconnect_winerrors:
+        return True
+    return False
+
+
+def ensure_source_available(source: Device) -> None:
+    if not source.path.exists():
+        raise SourceUnavailableError(f"Source is not available: {source.path}")
+
+
+def convert_source_io_error(source: Device, file_path: Path, exc: OSError) -> SourceUnavailableError:
+    if is_disconnect_error(exc) or not source.path.exists():
+        return SourceUnavailableError(f"Source disconnected while reading {file_path}")
+    return SourceUnavailableError(f"Source I/O error while reading {file_path}: {exc}")
+
+
+def copy_file_atomic(src: Path, dst: Path, expected_size: int | None = None, chunk_size: int = 4 * 1024 * 1024) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dst.with_name(dst.name + ".part")
+    if tmp_path.exists():
+        tmp_path.unlink()
+
+    bytes_written = 0
+    try:
+        with src.open("rb") as in_file, tmp_path.open("wb") as out_file:
+            while True:
+                chunk = in_file.read(chunk_size)
+                if not chunk:
+                    break
+                out_file.write(chunk)
+                bytes_written += len(chunk)
+            out_file.flush()
+            os.fsync(out_file.fileno())
+
+        if expected_size is not None and bytes_written != expected_size:
+            raise RuntimeError(
+                f"Incomplete copy for {src}: wrote {bytes_written} bytes, expected {expected_size}"
+            )
+
+        try:
+            shutil.copystat(src, tmp_path)
+        except OSError:
+            pass
+        tmp_path.replace(dst)
+    except BaseException:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
 
 
 def probe_audio_params(path: Path) -> tuple[int | None, int | None]:
@@ -306,10 +386,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
 
 
 def save_manifest(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    tmp_path.replace(path)
+    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def get_or_create_device_alias(manifest: dict[str, Any], source_id: str, display_name: str) -> str:
@@ -349,7 +426,6 @@ def make_quick_key(source_root: Path, file_path: Path, size: int, mtime_ns: int)
 
 
 def write_entries_file(path: Path, month_key: str, entries: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     lines: list[str] = [f"# FAQ Notes {month_key}\n"]
     last_day = ""
     for entry in entries:
@@ -360,7 +436,7 @@ def write_entries_file(path: Path, month_key: str, entries: list[dict[str, Any]]
             last_day = day_key
         lines.append(f"[{captured_at.strftime('%H:%M:%S')}]\n")
         lines.append(f"{entry['text'].strip()}\n\n")
-    path.write_text("".join(lines), encoding="utf-8")
+    atomic_write_text(path, "".join(lines), encoding="utf-8")
 
 
 def resolve_archive_root(raw_path: str) -> Path:
@@ -618,14 +694,26 @@ def discover_devices() -> list[Device]:
 
 
 def find_media_files(root: Path) -> list[Path]:
-    files: list[Path] = []
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        if path.suffix.lower() in SUPPORTED_EXTENSIONS:
-            files.append(path)
-    files.sort(key=lambda p: (p.stat().st_mtime, p.name.lower()))
-    return files
+    scored_paths: list[tuple[float, str, Path]] = []
+
+    def on_walk_error(exc: OSError) -> None:
+        if is_disconnect_error(exc) or not root.exists():
+            raise SourceUnavailableError(f"Source disconnected while scanning {root}") from exc
+        raise RuntimeError(f"Failed to scan source {root}: {exc}") from exc
+
+    for dir_path, _, file_names in os.walk(root, onerror=on_walk_error):
+        for file_name in file_names:
+            path = Path(dir_path) / file_name
+            if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            scored_paths.append((stat.st_mtime, path.name.lower(), path))
+
+    scored_paths.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in scored_paths]
 
 
 def choose_device_interactive(devices: list[Device]) -> Device | None:
@@ -785,7 +873,13 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
     print(f"\nSource: {source.path}")
     print(f"Device ID: {source.device_id} ({device_alias})")
     print(f"Duplicate mode: {args.dedupe_mode}")
-    media_files = find_media_files(source.path)
+    try:
+        ensure_source_available(source)
+        media_files = find_media_files(source.path)
+    except SourceUnavailableError as exc:
+        print(str(exc))
+        save_manifest(manifest_path, manifest)
+        return 0
     print(f"Media files found: {len(media_files)}")
     if not media_files:
         save_manifest(manifest_path, manifest)
@@ -793,27 +887,45 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
 
     new_items: list[dict[str, Any]] = []
     quick_index_changed = False
+    source_disconnected = False
+    disconnect_reason = ""
 
     for idx, media_file in enumerate(media_files, start=1):
-        stat = media_file.stat()
+        try:
+            ensure_source_available(source)
+            stat = media_file.stat()
+        except SourceUnavailableError as exc:
+            source_disconnected = True
+            disconnect_reason = str(exc)
+            break
+        except OSError as exc:
+            source_disconnected = True
+            disconnect_reason = str(convert_source_io_error(source, media_file, exc))
+            break
+
         quick_key = make_quick_key(source.path, media_file, stat.st_size, stat.st_mtime_ns)
         known_content_id = source_quick.get(quick_key)
         if known_content_id and known_content_id in known_hashes:
             continue
 
         fast_fingerprint = ""
-        if args.dedupe_mode == "fast":
-            print(f"Fingerprinting {idx}/{len(media_files)}: {media_file.name}")
-            fast_fingerprint = sampled_file_fingerprint(media_file, stat.st_size)
-            known_by_fingerprint = fast_index.get(fast_fingerprint)
-            if known_by_fingerprint and known_by_fingerprint in known_hashes:
-                source_quick[quick_key] = known_by_fingerprint
-                quick_index_changed = True
-                continue
-            content_id = fast_fingerprint
-        else:
-            print(f"Hashing {idx}/{len(media_files)}: {media_file.name}")
-            content_id = sha256_file(media_file)
+        try:
+            if args.dedupe_mode == "fast":
+                print(f"Fingerprinting {idx}/{len(media_files)}: {media_file.name}")
+                fast_fingerprint = sampled_file_fingerprint(media_file, stat.st_size)
+                known_by_fingerprint = fast_index.get(fast_fingerprint)
+                if known_by_fingerprint and known_by_fingerprint in known_hashes:
+                    source_quick[quick_key] = known_by_fingerprint
+                    quick_index_changed = True
+                    continue
+                content_id = fast_fingerprint
+            else:
+                print(f"Hashing {idx}/{len(media_files)}: {media_file.name}")
+                content_id = sha256_file(media_file)
+        except OSError as exc:
+            source_disconnected = True
+            disconnect_reason = str(convert_source_io_error(source, media_file, exc))
+            break
 
         source_quick[quick_key] = content_id
         quick_index_changed = True
@@ -829,8 +941,28 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
 
         target_name = copied_filename(captured_at, content_id, media_file.suffix)
         target_path = audio_dir / target_name
-        if not target_path.exists():
-            shutil.copy2(media_file, target_path)
+        try:
+            needs_copy = True
+            if target_path.exists():
+                existing_size = target_path.stat().st_size
+                if existing_size == stat.st_size:
+                    needs_copy = False
+                else:
+                    print(f"Existing copy size mismatch, recopying: {target_path.name}")
+                    target_path.unlink()
+            if needs_copy:
+                copy_file_atomic(media_file, target_path, expected_size=stat.st_size)
+        except OSError as exc:
+            source_disconnected = True
+            disconnect_reason = str(convert_source_io_error(source, media_file, exc))
+            break
+        except Exception as exc:
+            if "Incomplete copy" in str(exc) or not source.path.exists():
+                source_disconnected = True
+                disconnect_reason = f"Source disconnected while copying {media_file}"
+                break
+            print(f"Failed to copy {media_file.name}: {exc}")
+            continue
 
         new_items.append(
             {
@@ -846,6 +978,10 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
 
     if quick_index_changed:
         save_manifest(manifest_path, manifest)
+
+    if source_disconnected:
+        print(disconnect_reason)
+        print("Source disconnected mid-run. Already copied/transcribed files are safe; resume by reconnecting.")
 
     print(f"New files to process: {len(new_items)}")
     if not new_items:
@@ -895,7 +1031,12 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
             transcript_dir.mkdir(parents=True, exist_ok=True)
             token = hashlib.blake2s(content_id.encode("utf-8"), digest_size=4).hexdigest()
             transcript_path = transcript_dir / f"{captured_at.strftime('%Y%m%d_%H%M%S')}_{token}.txt"
-            transcript_path.write_text(transcript.strip(), encoding="utf-8")
+            try:
+                atomic_write_text(transcript_path, transcript.strip(), encoding="utf-8")
+            except OSError as exc:
+                failed += 1
+                print(f"Failed to write transcript {transcript_path.name}: {exc}")
+                continue
 
             known_hashes[content_id] = {
                 "source_id": source.device_id,
