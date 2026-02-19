@@ -19,11 +19,24 @@ USB recorder ingestion and Whisper transcription tool for FAQ voice notes.
 - `ffmpeg` and `ffprobe` on `PATH`
 - `OPENAI_API_KEY` environment variable
 - Python package: `openai`
+- Optional for tray mode on Windows: `pystray`, `Pillow`
 
 Install package:
 
 ```bash
 pip install openai
+```
+
+or install from requirements:
+
+```bash
+pip install -r requirements.txt
+```
+
+For tray mode:
+
+```bash
+pip install pystray pillow
 ```
 
 ## Usage
@@ -55,13 +68,25 @@ python faq_notes_ingest.py --yes
 Watch for newly connected devices:
 
 ```bash
-python faq_notes_ingest.py --watch --yes
+python faq_notes_ingest.py --watch
+```
+
+Run in Windows system tray (first time each device is seen, approval is required):
+
+```bash
+python faq_notes_ingest.py --tray
 ```
 
 Set parallel workers (default is parallel already):
 
 ```bash
 python faq_notes_ingest.py --workers 4
+```
+
+Use strict duplicate detection (slower, full-file SHA-256):
+
+```bash
+python faq_notes_ingest.py --dedupe-mode strict
 ```
 
 Custom archive root:
@@ -73,6 +98,17 @@ python faq_notes_ingest.py --archive-root "./faq_notes"
 Notes on archive root:
 - Default is `faq_notes` resolved relative to the script location, not the current working directory.
 - Manifest `copied_path` and `transcript_path` entries are stored archive-relative for portability.
+
+## Watch/tray approval behavior
+
+- In watch/tray mode, newly detected device IDs require manual approval once.
+- After approval, that exact device ID is auto-processed on future reconnects.
+- If a new device is not approved, it is ignored until approved on a later connection.
+
+## Duplicate detection modes
+
+- `fast` (default): sampled content fingerprint (size + sampled bytes from start/middle/end) for much faster duplicate checks.
+- `strict`: full-file SHA-256 (slower, highest confidence).
 
 ## Output structure
 

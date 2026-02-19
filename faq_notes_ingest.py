@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -41,6 +42,8 @@ LIMIT_BYTES = 25 * 1024 * 1024
 AUDIO_OPTS = ["-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", "192k"]
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_ARCHIVE_SUBDIR = "faq_notes"
+FAST_FINGERPRINT_PREFIX = "fpv1"
+FAST_FINGERPRINT_SAMPLE_BYTES = 1024 * 1024
 SUPPORTED_EXTENSIONS = {
     ".aac",
     ".aif",
@@ -250,6 +253,32 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def sampled_file_fingerprint(
+    path: Path,
+    file_size: int | None = None,
+    sample_bytes: int = FAST_FINGERPRINT_SAMPLE_BYTES,
+) -> str:
+    size = file_size if file_size is not None else path.stat().st_size
+    digest = hashlib.blake2b(digest_size=20)
+    digest.update(size.to_bytes(8, "little", signed=False))
+
+    with path.open("rb") as f:
+        if size <= sample_bytes * 3:
+            digest.update(f.read())
+        else:
+            digest.update(f.read(sample_bytes))
+
+            middle_offset = max((size // 2) - (sample_bytes // 2), 0)
+            f.seek(middle_offset)
+            digest.update(f.read(sample_bytes))
+
+            tail_offset = max(size - sample_bytes, 0)
+            f.seek(tail_offset)
+            digest.update(f.read(sample_bytes))
+
+    return f"{FAST_FINGERPRINT_PREFIX}:{size}:{digest.hexdigest()}"
+
+
 def load_manifest(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {
@@ -257,6 +286,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
             "files": {},
             "quick_index": {},
             "devices": {},
+            "fast_index": {},
         }
 
     try:
@@ -267,6 +297,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
         payload.setdefault("files", {})
         payload.setdefault("quick_index", {})
         payload.setdefault("devices", {})
+        payload.setdefault("fast_index", {})
         if payload["schema_version"] < 2:
             payload["schema_version"] = 2
         return payload
@@ -284,16 +315,28 @@ def save_manifest(path: Path, payload: dict[str, Any]) -> None:
 def get_or_create_device_alias(manifest: dict[str, Any], source_id: str, display_name: str) -> str:
     devices: dict[str, Any] = manifest.setdefault("devices", {})
     current = devices.get(source_id)
+    aliases = {str(v.get("alias", "")) for v in devices.values()}
     if current:
         current["display_name"] = display_name
-        return str(current.get("alias", "device_1"))
+        alias = str(current.get("alias", "")).strip()
+        if not alias:
+            idx = 1
+            while f"device_{idx}" in aliases:
+                idx += 1
+            alias = f"device_{idx}"
+            current["alias"] = alias
+        current.setdefault("auto_approved", False)
+        return alias
 
-    aliases = {str(v.get("alias", "")) for v in devices.values()}
     idx = 1
     while f"device_{idx}" in aliases:
         idx += 1
     alias = f"device_{idx}"
-    devices[source_id] = {"alias": alias, "display_name": display_name}
+    devices[source_id] = {
+        "alias": alias,
+        "display_name": display_name,
+        "auto_approved": False,
+    }
     return alias
 
 
@@ -367,6 +410,38 @@ def normalize_manifest_paths(archive_root: Path, manifest: dict[str, Any]) -> bo
             if normalized != raw_value:
                 meta[key] = normalized
                 changed = True
+    return changed
+
+
+def refresh_fast_index(archive_root: Path, manifest: dict[str, Any]) -> bool:
+    files: dict[str, Any] = manifest.get("files", {})
+    rebuilt: dict[str, str] = {}
+    changed = False
+
+    for content_id, meta in files.items():
+        if not isinstance(meta, dict):
+            continue
+
+        fingerprint = str(meta.get("fast_fingerprint", "")).strip()
+        if not fingerprint:
+            copied_path_raw = meta.get("copied_path")
+            if copied_path_raw:
+                copied_path = resolve_manifest_file_path(archive_root, str(copied_path_raw))
+                if copied_path.exists():
+                    try:
+                        fingerprint = sampled_file_fingerprint(copied_path)
+                    except Exception:
+                        fingerprint = ""
+                    if fingerprint:
+                        meta["fast_fingerprint"] = fingerprint
+                        changed = True
+
+        if fingerprint and fingerprint not in rebuilt:
+            rebuilt[fingerprint] = content_id
+
+    if manifest.get("fast_index") != rebuilt:
+        manifest["fast_index"] = rebuilt
+        changed = True
     return changed
 
 
@@ -606,7 +681,8 @@ def make_archive_paths(archive_root: Path) -> tuple[Path, Path]:
 
 def copied_filename(captured_at: datetime, file_hash: str, suffix: str) -> str:
     timestamp = captured_at.strftime("%Y%m%d_%H%M%S")
-    return f"{timestamp}_{file_hash[:8]}{suffix.lower()}"
+    token = hashlib.blake2s(file_hash.encode("utf-8"), digest_size=4).hexdigest()
+    return f"{timestamp}_{token}{suffix.lower()}"
 
 
 def prompt_yes_no(message: str, default_yes: bool = True) -> bool:
@@ -615,6 +691,69 @@ def prompt_yes_no(message: str, default_yes: bool = True) -> bool:
     if not raw:
         return default_yes
     return raw in {"y", "yes"}
+
+
+def prompt_yes_no_windows(message: str, title: str, default_yes: bool = False) -> bool:
+    if os.name != "nt":
+        return False
+    user32 = ctypes.windll.user32
+    flags = 0x00000004 | 0x00000020  # MB_YESNO | MB_ICONQUESTION
+    if not default_yes:
+        flags |= 0x00000100  # MB_DEFBUTTON2
+    result = user32.MessageBoxW(None, message, title, flags)
+    return result == 6  # IDYES
+
+
+def prompt_device_auto_approval(args: argparse.Namespace, source: Device, device_alias: str) -> bool:
+    message = (
+        "New device detected.\n\n"
+        f"Alias: {device_alias}\n"
+        f"Device ID: {source.device_id}\n"
+        f"Name: {source.name}\n\n"
+        "Approve this device for automatic processing on future reconnects?\n"
+        "If approved, this connection will process now."
+    )
+
+    if args.tray and os.name == "nt":
+        return prompt_yes_no_windows(message, "FAQ Notes Tool", default_yes=False)
+
+    print(f"\nDetected new device (approval required): {source.name}")
+    print(f"Device ID: {source.device_id} ({device_alias})")
+    if sys.stdin.isatty():
+        return prompt_yes_no(
+            "Approve this device for automatic processing in watch mode?",
+            default_yes=False,
+        )
+
+    print("Skipping unapproved device: no interactive prompt is available.")
+    return False
+
+
+def should_process_in_watch_mode(args: argparse.Namespace, source: Device) -> bool:
+    archive_root = resolve_archive_root(args.archive_root)
+    archive_root, manifest_path = make_archive_paths(archive_root)
+    manifest = load_manifest(manifest_path)
+    changed = normalize_manifest_paths(archive_root, manifest)
+
+    device_alias = get_or_create_device_alias(manifest, source.device_id, source.name)
+    devices: dict[str, Any] = manifest.setdefault("devices", {})
+    device_meta: dict[str, Any] = devices.setdefault(source.device_id, {})
+    auto_approved = bool(device_meta.get("auto_approved"))
+
+    if auto_approved:
+        # Persist display name/alias schema updates for previously approved devices.
+        save_manifest(manifest_path, manifest)
+        return True
+
+    approved = prompt_device_auto_approval(args, source, device_alias)
+    device_meta["auto_approved"] = approved
+    if approved:
+        device_meta["approved_at_local"] = datetime.now().isoformat(timespec="seconds")
+        print(f"Approved {source.name}; starting ingestion.")
+    else:
+        print(f"Ignored {source.name}; not approved for auto-processing.")
+    save_manifest(manifest_path, manifest)
+    return approved
 
 
 def notify_complete() -> None:
@@ -635,13 +774,17 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
     manifest = load_manifest(manifest_path)
     if normalize_manifest_paths(archive_root, manifest):
         save_manifest(manifest_path, manifest)
+    if args.dedupe_mode == "fast" and refresh_fast_index(archive_root, manifest):
+        save_manifest(manifest_path, manifest)
     known_hashes: dict[str, Any] = manifest.get("files", {})
     quick_index_root: dict[str, Any] = manifest.setdefault("quick_index", {})
+    fast_index: dict[str, str] = manifest.setdefault("fast_index", {})
     source_quick: dict[str, str] = quick_index_root.setdefault(source.device_id, {})
     device_alias = get_or_create_device_alias(manifest, source.device_id, source.name)
 
     print(f"\nSource: {source.path}")
     print(f"Device ID: {source.device_id} ({device_alias})")
+    print(f"Duplicate mode: {args.dedupe_mode}")
     media_files = find_media_files(source.path)
     print(f"Media files found: {len(media_files)}")
     if not media_files:
@@ -654,16 +797,28 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
     for idx, media_file in enumerate(media_files, start=1):
         stat = media_file.stat()
         quick_key = make_quick_key(source.path, media_file, stat.st_size, stat.st_mtime_ns)
-        known_digest = source_quick.get(quick_key)
-        if known_digest and known_digest in known_hashes:
+        known_content_id = source_quick.get(quick_key)
+        if known_content_id and known_content_id in known_hashes:
             continue
 
-        print(f"Hashing {idx}/{len(media_files)}: {media_file.name}")
-        digest = sha256_file(media_file)
-        source_quick[quick_key] = digest
+        fast_fingerprint = ""
+        if args.dedupe_mode == "fast":
+            print(f"Fingerprinting {idx}/{len(media_files)}: {media_file.name}")
+            fast_fingerprint = sampled_file_fingerprint(media_file, stat.st_size)
+            known_by_fingerprint = fast_index.get(fast_fingerprint)
+            if known_by_fingerprint and known_by_fingerprint in known_hashes:
+                source_quick[quick_key] = known_by_fingerprint
+                quick_index_changed = True
+                continue
+            content_id = fast_fingerprint
+        else:
+            print(f"Hashing {idx}/{len(media_files)}: {media_file.name}")
+            content_id = sha256_file(media_file)
+
+        source_quick[quick_key] = content_id
         quick_index_changed = True
 
-        if digest in known_hashes:
+        if content_id in known_hashes:
             continue
 
         captured_at = datetime.fromtimestamp(stat.st_mtime)
@@ -672,7 +827,7 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
         audio_dir = month_dir / "audio"
         audio_dir.mkdir(parents=True, exist_ok=True)
 
-        target_name = copied_filename(captured_at, digest, media_file.suffix)
+        target_name = copied_filename(captured_at, content_id, media_file.suffix)
         target_path = audio_dir / target_name
         if not target_path.exists():
             shutil.copy2(media_file, target_path)
@@ -680,11 +835,12 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
         new_items.append(
             {
                 "source_file": media_file,
-                "digest": digest,
+                "content_id": content_id,
                 "captured_at": captured_at,
                 "month_key": month_key,
                 "month_dir": month_dir,
                 "target_path": target_path,
+                "fast_fingerprint": fast_fingerprint,
             }
         )
 
@@ -695,7 +851,7 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
     if not new_items:
         return 0
 
-    if not args.yes and not prompt_yes_no("Copy and transcribe new files?"):
+    if not args.yes and not args.watch and not prompt_yes_no("Copy and transcribe new files?"):
         print("Cancelled by user.")
         return 0
 
@@ -732,14 +888,16 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
             month_key: str = item["month_key"]
             month_dir: Path = item["month_dir"]
             source_file: Path = item["source_file"]
-            digest: str = item["digest"]
+            content_id: str = item["content_id"]
+            fast_fingerprint: str = item["fast_fingerprint"]
 
             transcript_dir = month_dir / "transcripts"
             transcript_dir.mkdir(parents=True, exist_ok=True)
-            transcript_path = transcript_dir / f"{captured_at.strftime('%Y%m%d_%H%M%S')}_{digest[:8]}.txt"
+            token = hashlib.blake2s(content_id.encode("utf-8"), digest_size=4).hexdigest()
+            transcript_path = transcript_dir / f"{captured_at.strftime('%Y%m%d_%H%M%S')}_{token}.txt"
             transcript_path.write_text(transcript.strip(), encoding="utf-8")
 
-            known_hashes[digest] = {
+            known_hashes[content_id] = {
                 "source_id": source.device_id,
                 "source_name": source.name,
                 "device_alias": device_alias,
@@ -749,8 +907,14 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
                 "captured_at_local": captured_at.isoformat(timespec="seconds"),
                 "processed_at_local": datetime.now().isoformat(timespec="seconds"),
                 "month_key": month_key,
+                "content_id": content_id,
+                "dedupe_mode": args.dedupe_mode,
+                "fast_fingerprint": fast_fingerprint,
             }
+            if fast_fingerprint:
+                fast_index[fast_fingerprint] = content_id
             manifest["files"] = known_hashes
+            manifest["fast_index"] = fast_index
             save_manifest(manifest_path, manifest)
             touched_months.add(month_key)
             processed += 1
@@ -763,24 +927,76 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
     return processed
 
 
-def run_watch_mode(args: argparse.Namespace) -> None:
+def poll_watch_cycle(args: argparse.Namespace, seen_ids: set[str]) -> set[str]:
+    current = discover_devices()
+    current_ids = {d.device_id for d in current}
+    new_devices = [d for d in current if d.device_id not in seen_ids]
+    for device in new_devices:
+        print(f"\nDetected new device: {device.name}")
+        try:
+            if should_process_in_watch_mode(args, device):
+                process_source(args, device)
+        except Exception as exc:
+            print(f"Error processing {device.path}: {exc}")
+    return current_ids
+
+
+def run_watch_mode(args: argparse.Namespace, stop_event: threading.Event | None = None) -> None:
     print("Watch mode enabled.")
     print("Waiting for newly connected devices. Press Ctrl+C to stop.")
     seen_ids = {d.device_id for d in discover_devices()}
     interval = max(2, args.interval)
 
     while True:
-        time.sleep(interval)
-        current = discover_devices()
-        current_ids = {d.device_id for d in current}
-        new_devices = [d for d in current if d.device_id not in seen_ids]
-        for device in new_devices:
-            print(f"\nDetected new device: {device.name}")
-            try:
-                process_source(args, device)
-            except Exception as exc:
-                print(f"Error processing {device.path}: {exc}")
-        seen_ids = current_ids
+        if stop_event is None:
+            time.sleep(interval)
+        elif stop_event.wait(interval):
+            break
+        seen_ids = poll_watch_cycle(args, seen_ids)
+
+
+def build_tray_image() -> Any:
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (64, 64), "#0f3a2e")
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((6, 6, 58, 58), radius=12, fill="#1a5e49")
+    draw.rectangle((18, 14, 46, 50), fill="#d9f3e8")
+    draw.rectangle((22, 20, 42, 26), fill="#1a5e49")
+    draw.rectangle((22, 30, 42, 36), fill="#1a5e49")
+    draw.rectangle((22, 40, 34, 46), fill="#1a5e49")
+    return image
+
+
+def run_tray_mode(args: argparse.Namespace) -> None:
+    if os.name != "nt":
+        raise SystemExit("--tray is currently supported on Windows only.")
+    try:
+        import pystray
+    except ImportError as exc:
+        raise SystemExit("Tray mode requires 'pystray' and 'Pillow'. Install with: pip install pystray pillow") from exc
+
+    print("Tray mode enabled.")
+    print("The app is running in the system tray.")
+    stop_event = threading.Event()
+    watch_thread = threading.Thread(target=run_watch_mode, args=(args, stop_event), daemon=True)
+    watch_thread.start()
+
+    def on_quit(icon: Any, item: Any) -> None:
+        stop_event.set()
+        icon.stop()
+
+    icon = pystray.Icon(
+        "faq_notes_ingest",
+        build_tray_image(),
+        "FAQ Notes Tool",
+        pystray.Menu(pystray.MenuItem("Quit", on_quit)),
+    )
+    try:
+        icon.run()
+    finally:
+        stop_event.set()
+        watch_thread.join(timeout=max(2, args.interval) + 2)
 
 
 def parse_args() -> argparse.Namespace:
@@ -800,12 +1016,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--yes",
         action="store_true",
-        help="Skip confirmation prompt and process immediately.",
+        help="Skip confirmation prompt for one-off (non-watch) processing.",
     )
     parser.add_argument(
         "--watch",
         action="store_true",
         help="Continuously watch for newly connected devices and auto-process.",
+    )
+    parser.add_argument(
+        "--tray",
+        action="store_true",
+        help="Windows system tray mode (watch mode with first-time device approval prompts).",
     )
     parser.add_argument(
         "--interval",
@@ -819,6 +1040,12 @@ def parse_args() -> argparse.Namespace:
         default=recommended_workers,
         help=f"Parallel transcription workers (default: {recommended_workers}). Use 1 for sequential.",
     )
+    parser.add_argument(
+        "--dedupe-mode",
+        choices=("fast", "strict"),
+        default="fast",
+        help="Duplicate detection mode: 'fast' uses sampled content fingerprints, 'strict' uses full SHA-256.",
+    )
     return parser.parse_args()
 
 
@@ -827,6 +1054,11 @@ def main() -> None:
     require_tool("ffprobe")
 
     args = parse_args()
+    if args.tray:
+        args.watch = True
+        run_tray_mode(args)
+        return
+
     if args.watch:
         run_watch_mode(args)
         return
