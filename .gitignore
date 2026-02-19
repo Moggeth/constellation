@@ -1,0 +1,19 @@
+# Python cache artifacts
+__pycache__/
+*.py[cod]
+
+# Generated personal archive/output data
+faq_notes/*
+!faq_notes/.gitkeep
+
+# Ignore audio files to keep repo size manageable
+*.mp3
+*.wav
+*.m4a
+*.flac
+*.aac
+*.ogg
+*.opus
+*.wma
+*.aiff
+*.alac
