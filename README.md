@@ -19,6 +19,7 @@ USB recorder ingestion and Whisper transcription tool for FAQ voice notes.
 - `ffmpeg` and `ffprobe` on `PATH`
 - `OPENAI_API_KEY` environment variable
 - Python package: `openai`
+- Optional for PostgreSQL backend: `psycopg[binary]`
 - Optional for tray mode on Windows: `pystray`, `Pillow`
 
 Install package:
@@ -95,6 +96,26 @@ Custom archive root:
 python faq_notes_ingest.py --archive-root "./faq_notes"
 ```
 
+Use PostgreSQL for ingest state (devices, dedupe index, processed files):
+
+```bash
+python faq_notes_ingest.py --storage-backend postgres --account-id "alice" --database-url "postgresql://user:pass@host:5432/faq_notes"
+```
+
+Use env vars instead of CLI args:
+
+```bash
+set FAQ_NOTES_DATABASE_URL=postgresql://user:pass@host:5432/faq_notes
+set FAQ_NOTES_ACCOUNT_ID=alice
+python faq_notes_ingest.py --storage-backend postgres
+```
+
+One-time migration from local `manifest.json` into PostgreSQL:
+
+```bash
+python faq_notes_ingest.py --storage-backend postgres --account-id "alice" --database-url "postgresql://user:pass@host:5432/faq_notes" --migrate-manifest --migrate-only
+```
+
 Notes on archive root:
 - Default is `faq_notes` resolved relative to the script location, not the current working directory.
 - Manifest `copied_path` and `transcript_path` entries are stored archive-relative for portability.
@@ -109,6 +130,15 @@ Notes on archive root:
 
 - `fast` (default): sampled content fingerprint (size + sampled bytes from start/middle/end) for much faster duplicate checks.
 - `strict`: full-file SHA-256 (slower, highest confidence).
+
+## Storage backends
+
+- `json` (default): writes `faq_notes/manifest.json` as the ingest index.
+- `postgres`: stores ingest index in PostgreSQL tables (`faq_devices`, `faq_files`, `faq_quick_index`).
+- Postgres mode requires an account ID (`--account-id` or `FAQ_NOTES_ACCOUNT_ID`) so each user's state is isolated.
+- Monthly human-readable outputs are unchanged in both modes:
+  - `faq_notes/YYYY-MM/FAQ_YYYY-MM.txt`
+  - `faq_notes/YYYY-MM/FAQ_YYYY-MM_device_*.txt`
 
 ## Interrupt/disconnect safety
 

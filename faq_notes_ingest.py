@@ -16,6 +16,7 @@ Workflow:
 from __future__ import annotations
 
 import argparse
+import copy
 import ctypes
 import errno
 import hashlib
@@ -34,7 +35,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from openai import APIConnectionError, APITimeoutError, OpenAI, RateLimitError
 
@@ -45,6 +46,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_ARCHIVE_SUBDIR = "faq_notes"
 FAST_FINGERPRINT_PREFIX = "fpv1"
 FAST_FINGERPRINT_SAMPLE_BYTES = 1024 * 1024
+ACCOUNT_SCOPE_PREFIX = "acct::"
+DEFAULT_ACCOUNT_ID = "default"
 SUPPORTED_EXTENSIONS = {
     ".aac",
     ".aif",
@@ -82,6 +85,399 @@ class Device:
 
 class SourceUnavailableError(RuntimeError):
     """Raised when the currently selected source device disappears mid-run."""
+
+
+class ManifestStore(Protocol):
+    def load(self) -> dict[str, Any]:
+        ...
+
+    def save(self, payload: dict[str, Any]) -> None:
+        ...
+
+
+class JsonManifestStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def load(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return {
+                "schema_version": 2,
+                "files": {},
+                "quick_index": {},
+                "devices": {},
+                "fast_index": {},
+            }
+
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("manifest root must be an object")
+            payload.setdefault("schema_version", 2)
+            payload.setdefault("files", {})
+            payload.setdefault("quick_index", {})
+            payload.setdefault("devices", {})
+            payload.setdefault("fast_index", {})
+            if payload["schema_version"] < 2:
+                payload["schema_version"] = 2
+            return payload
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read manifest at {self.path}: {exc}") from exc
+
+    def save(self, payload: dict[str, Any]) -> None:
+        atomic_write_text(self.path, json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+class PostgresManifestStore:
+    def __init__(self, database_url: str, account_id: str) -> None:
+        normalized_account = account_id.strip()
+        if not normalized_account:
+            raise SystemExit("PostgreSQL backend requires a non-empty account ID.")
+
+        self.database_url = database_url
+        self.account_id = normalized_account
+        self._scope_prefix = f"{ACCOUNT_SCOPE_PREFIX}{self.account_id}::"
+        self._psycopg = None
+        self._schema_ready = False
+        self._last_saved: dict[str, Any] | None = None
+
+    def _scope_token(self, raw: str) -> str:
+        return f"{self._scope_prefix}{raw}"
+
+    def _unscope_token(self, stored: str) -> str | None:
+        if stored.startswith(ACCOUNT_SCOPE_PREFIX):
+            if stored.startswith(self._scope_prefix):
+                return stored[len(self._scope_prefix) :]
+            return None
+        if self.account_id == DEFAULT_ACCOUNT_ID:
+            return stored
+        return None
+
+    def _driver(self) -> Any:
+        if self._psycopg is not None:
+            return self._psycopg
+        try:
+            import psycopg  # type: ignore
+        except ImportError as exc:
+            raise SystemExit(
+                "PostgreSQL backend requires 'psycopg'. Install with: pip install psycopg[binary]"
+            ) from exc
+        self._psycopg = psycopg
+        return psycopg
+
+    def _connect(self) -> Any:
+        psycopg = self._driver()
+        return psycopg.connect(self.database_url)
+
+    def _ensure_schema(self, conn: Any) -> None:
+        if self._schema_ready:
+            return
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS faq_devices (
+                    device_id TEXT PRIMARY KEY,
+                    alias TEXT NOT NULL UNIQUE,
+                    display_name TEXT NOT NULL,
+                    auto_approved BOOLEAN NOT NULL DEFAULT FALSE,
+                    approved_at_local TEXT
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS faq_files (
+                    content_id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL,
+                    source_name TEXT NOT NULL,
+                    device_alias TEXT NOT NULL,
+                    source_path TEXT NOT NULL,
+                    copied_path TEXT NOT NULL,
+                    transcript_path TEXT NOT NULL,
+                    captured_at_local TEXT NOT NULL,
+                    processed_at_local TEXT NOT NULL,
+                    month_key TEXT NOT NULL,
+                    dedupe_mode TEXT NOT NULL,
+                    fast_fingerprint TEXT UNIQUE
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS faq_quick_index (
+                    source_id TEXT NOT NULL,
+                    quick_key TEXT NOT NULL,
+                    content_id TEXT NOT NULL,
+                    PRIMARY KEY (source_id, quick_key)
+                )
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_faq_files_month_key ON faq_files (month_key)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_faq_quick_index_source_id ON faq_quick_index (source_id)"
+            )
+        conn.commit()
+        self._schema_ready = True
+
+    def load(self) -> dict[str, Any]:
+        devices: dict[str, Any] = {}
+        files: dict[str, Any] = {}
+        quick_index: dict[str, dict[str, str]] = defaultdict(dict)
+        fast_index: dict[str, str] = {}
+
+        with self._connect() as conn:
+            self._ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT device_id, alias, display_name, auto_approved, approved_at_local
+                    FROM faq_devices
+                    """
+                )
+                for row in cur.fetchall():
+                    device_id, alias, display_name, auto_approved, approved_at_local = row
+                    unscoped_device_id = self._unscope_token(str(device_id))
+                    unscoped_alias = self._unscope_token(str(alias))
+                    if unscoped_device_id is None or unscoped_alias is None:
+                        continue
+                    devices[unscoped_device_id] = {
+                        "alias": unscoped_alias,
+                        "display_name": str(display_name),
+                        "auto_approved": bool(auto_approved),
+                        "approved_at_local": str(approved_at_local) if approved_at_local else None,
+                    }
+
+                cur.execute(
+                    """
+                    SELECT
+                        content_id,
+                        source_id,
+                        source_name,
+                        device_alias,
+                        source_path,
+                        copied_path,
+                        transcript_path,
+                        captured_at_local,
+                        processed_at_local,
+                        month_key,
+                        dedupe_mode,
+                        fast_fingerprint
+                    FROM faq_files
+                    """
+                )
+                for row in cur.fetchall():
+                    (
+                        content_id,
+                        source_id,
+                        source_name,
+                        device_alias,
+                        source_path,
+                        copied_path,
+                        transcript_path,
+                        captured_at_local,
+                        processed_at_local,
+                        month_key,
+                        dedupe_mode,
+                        fast_fingerprint,
+                    ) = row
+                    unscoped_content_id = self._unscope_token(str(content_id))
+                    unscoped_source_id = self._unscope_token(str(source_id))
+                    unscoped_device_alias = self._unscope_token(str(device_alias))
+                    if (
+                        unscoped_content_id is None
+                        or unscoped_source_id is None
+                        or unscoped_device_alias is None
+                    ):
+                        continue
+
+                    fp = ""
+                    if fast_fingerprint:
+                        unscoped_fingerprint = self._unscope_token(str(fast_fingerprint).strip())
+                        if unscoped_fingerprint is None:
+                            continue
+                        fp = unscoped_fingerprint
+
+                    files[unscoped_content_id] = {
+                        "source_id": unscoped_source_id,
+                        "source_name": str(source_name),
+                        "device_alias": unscoped_device_alias,
+                        "source_path": str(source_path),
+                        "copied_path": str(copied_path),
+                        "transcript_path": str(transcript_path),
+                        "captured_at_local": str(captured_at_local),
+                        "processed_at_local": str(processed_at_local),
+                        "month_key": str(month_key),
+                        "content_id": unscoped_content_id,
+                        "dedupe_mode": str(dedupe_mode),
+                        "fast_fingerprint": fp,
+                    }
+                    if fp and fp not in fast_index:
+                        fast_index[fp] = unscoped_content_id
+
+                cur.execute("SELECT source_id, quick_key, content_id FROM faq_quick_index")
+                for row in cur.fetchall():
+                    source_id, quick_key, content_id = row
+                    unscoped_source_id = self._unscope_token(str(source_id))
+                    unscoped_content_id = self._unscope_token(str(content_id))
+                    if unscoped_source_id is None or unscoped_content_id is None:
+                        continue
+                    quick_index[unscoped_source_id][str(quick_key)] = unscoped_content_id
+
+        payload = {
+            "schema_version": 2,
+            "files": files,
+            "quick_index": dict(quick_index),
+            "devices": devices,
+            "fast_index": fast_index,
+        }
+        self._last_saved = copy.deepcopy(payload)
+        return payload
+
+    def save(self, payload: dict[str, Any]) -> None:
+        current_devices: dict[str, Any] = payload.get("devices", {})
+        current_files: dict[str, Any] = payload.get("files", {})
+        current_quick_index: dict[str, Any] = payload.get("quick_index", {})
+
+        previous = self._last_saved or {
+            "devices": {},
+            "files": {},
+            "quick_index": {},
+        }
+        previous_devices: dict[str, Any] = previous.get("devices", {})
+        previous_files: dict[str, Any] = previous.get("files", {})
+        previous_quick_index: dict[str, Any] = previous.get("quick_index", {})
+
+        device_rows: list[tuple[Any, ...]] = []
+        for device_id, meta in current_devices.items():
+            if not isinstance(meta, dict):
+                continue
+            if previous_devices.get(device_id) == meta:
+                continue
+            alias = str(meta.get("alias", "")).strip()
+            if not alias:
+                continue
+            approved_at_local = meta.get("approved_at_local")
+            device_rows.append(
+                (
+                    self._scope_token(str(device_id)),
+                    self._scope_token(alias),
+                    str(meta.get("display_name", "")),
+                    bool(meta.get("auto_approved", False)),
+                    str(approved_at_local) if approved_at_local else None,
+                )
+            )
+
+        file_rows: list[tuple[Any, ...]] = []
+        for content_id, meta in current_files.items():
+            if not isinstance(meta, dict):
+                continue
+            if previous_files.get(content_id) == meta:
+                continue
+            fingerprint = str(meta.get("fast_fingerprint", "")).strip()
+            file_rows.append(
+                (
+                    self._scope_token(str(content_id)),
+                    self._scope_token(str(meta.get("source_id", ""))),
+                    str(meta.get("source_name", "")),
+                    self._scope_token(str(meta.get("device_alias", ""))),
+                    str(meta.get("source_path", "")),
+                    str(meta.get("copied_path", "")),
+                    str(meta.get("transcript_path", "")),
+                    str(meta.get("captured_at_local", "")),
+                    str(meta.get("processed_at_local", "")),
+                    str(meta.get("month_key", "")),
+                    str(meta.get("dedupe_mode", "")),
+                    self._scope_token(fingerprint) if fingerprint else None,
+                )
+            )
+
+        quick_rows: list[tuple[str, str, str]] = []
+        for source_id, source_map in current_quick_index.items():
+            if not isinstance(source_map, dict):
+                continue
+            prev_source_map = previous_quick_index.get(source_id, {})
+            for quick_key, content_id in source_map.items():
+                if prev_source_map.get(quick_key) == content_id:
+                    continue
+                quick_rows.append(
+                    (
+                        self._scope_token(str(source_id)),
+                        str(quick_key),
+                        self._scope_token(str(content_id)),
+                    )
+                )
+
+        if not device_rows and not file_rows and not quick_rows:
+            return
+
+        with self._connect() as conn:
+            self._ensure_schema(conn)
+            with conn.cursor() as cur:
+                if device_rows:
+                    cur.executemany(
+                        """
+                        INSERT INTO faq_devices (
+                            device_id, alias, display_name, auto_approved, approved_at_local
+                        )
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (device_id) DO UPDATE
+                        SET
+                            alias = EXCLUDED.alias,
+                            display_name = EXCLUDED.display_name,
+                            auto_approved = EXCLUDED.auto_approved,
+                            approved_at_local = EXCLUDED.approved_at_local
+                        """,
+                        device_rows,
+                    )
+                if file_rows:
+                    cur.executemany(
+                        """
+                        INSERT INTO faq_files (
+                            content_id,
+                            source_id,
+                            source_name,
+                            device_alias,
+                            source_path,
+                            copied_path,
+                            transcript_path,
+                            captured_at_local,
+                            processed_at_local,
+                            month_key,
+                            dedupe_mode,
+                            fast_fingerprint
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (content_id) DO UPDATE
+                        SET
+                            source_id = EXCLUDED.source_id,
+                            source_name = EXCLUDED.source_name,
+                            device_alias = EXCLUDED.device_alias,
+                            source_path = EXCLUDED.source_path,
+                            copied_path = EXCLUDED.copied_path,
+                            transcript_path = EXCLUDED.transcript_path,
+                            captured_at_local = EXCLUDED.captured_at_local,
+                            processed_at_local = EXCLUDED.processed_at_local,
+                            month_key = EXCLUDED.month_key,
+                            dedupe_mode = EXCLUDED.dedupe_mode,
+                            fast_fingerprint = EXCLUDED.fast_fingerprint
+                        """,
+                        file_rows,
+                    )
+                if quick_rows:
+                    cur.executemany(
+                        """
+                        INSERT INTO faq_quick_index (source_id, quick_key, content_id)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (source_id, quick_key) DO UPDATE
+                        SET content_id = EXCLUDED.content_id
+                        """,
+                        quick_rows,
+                    )
+            conn.commit()
+
+        self._last_saved = copy.deepcopy(payload)
 
 
 def default_worker_count() -> int:
@@ -359,34 +755,98 @@ def sampled_file_fingerprint(
     return f"{FAST_FINGERPRINT_PREFIX}:{size}:{digest.hexdigest()}"
 
 
-def load_manifest(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {
-            "schema_version": 2,
-            "files": {},
-            "quick_index": {},
-            "devices": {},
-            "fast_index": {},
-        }
-
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError("manifest root must be an object")
-        payload.setdefault("schema_version", 2)
-        payload.setdefault("files", {})
-        payload.setdefault("quick_index", {})
-        payload.setdefault("devices", {})
-        payload.setdefault("fast_index", {})
-        if payload["schema_version"] < 2:
-            payload["schema_version"] = 2
-        return payload
-    except Exception as exc:
-        raise RuntimeError(f"Failed to read manifest at {path}: {exc}") from exc
+def load_manifest(store: ManifestStore) -> dict[str, Any]:
+    payload = store.load()
+    payload.setdefault("schema_version", 2)
+    payload.setdefault("files", {})
+    payload.setdefault("quick_index", {})
+    payload.setdefault("devices", {})
+    payload.setdefault("fast_index", {})
+    if payload["schema_version"] < 2:
+        payload["schema_version"] = 2
+    return payload
 
 
-def save_manifest(path: Path, payload: dict[str, Any]) -> None:
-    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+def save_manifest(store: ManifestStore, payload: dict[str, Any]) -> None:
+    store.save(payload)
+
+
+def resolve_postgres_account_id(args: argparse.Namespace) -> str:
+    account_id = (args.account_id or os.getenv("FAQ_NOTES_ACCOUNT_ID") or "").strip()
+    if not account_id:
+        raise SystemExit(
+            "PostgreSQL backend selected but no account ID was provided. "
+            "Set --account-id or FAQ_NOTES_ACCOUNT_ID."
+        )
+    return account_id
+
+
+def create_manifest_store(args: argparse.Namespace, manifest_path: Path) -> ManifestStore:
+    if args.storage_backend == "json":
+        return JsonManifestStore(manifest_path)
+
+    db_url = (
+        args.database_url
+        or os.getenv("FAQ_NOTES_DATABASE_URL")
+        or os.getenv("DATABASE_URL")
+    )
+    if not db_url:
+        raise SystemExit(
+            "PostgreSQL backend selected but no database URL was provided. "
+            "Set --database-url or FAQ_NOTES_DATABASE_URL."
+        )
+    account_id = resolve_postgres_account_id(args)
+    return PostgresManifestStore(db_url, account_id)
+
+
+def merge_manifest_data(target: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    target_devices: dict[str, Any] = target.setdefault("devices", {})
+    for source_id, meta in incoming.get("devices", {}).items():
+        if isinstance(meta, dict):
+            target_devices[source_id] = meta
+
+    target_files: dict[str, Any] = target.setdefault("files", {})
+    for content_id, meta in incoming.get("files", {}).items():
+        if isinstance(meta, dict):
+            target_files[content_id] = meta
+
+    target_quick: dict[str, Any] = target.setdefault("quick_index", {})
+    for source_id, entries in incoming.get("quick_index", {}).items():
+        if not isinstance(entries, dict):
+            continue
+        bucket: dict[str, Any] = target_quick.setdefault(source_id, {})
+        for quick_key, content_id in entries.items():
+            bucket[quick_key] = content_id
+
+    fast_index: dict[str, str] = {}
+    for content_id, meta in target_files.items():
+        if not isinstance(meta, dict):
+            continue
+        fingerprint = str(meta.get("fast_fingerprint", "")).strip()
+        if fingerprint and fingerprint not in fast_index:
+            fast_index[fingerprint] = str(content_id)
+    target["fast_index"] = fast_index
+    target["schema_version"] = 2
+    return target
+
+
+def migrate_manifest_to_postgres(args: argparse.Namespace, manifest_path: Path) -> None:
+    if args.storage_backend != "postgres":
+        raise SystemExit("--migrate-manifest requires --storage-backend postgres.")
+    if not manifest_path.exists():
+        print(f"No local manifest found at {manifest_path}; skipping migration.")
+        return
+
+    json_store = JsonManifestStore(manifest_path)
+    source_manifest = load_manifest(json_store)
+    target_store = create_manifest_store(args, manifest_path)
+    target_manifest = load_manifest(target_store)
+    merged = merge_manifest_data(target_manifest, source_manifest)
+    save_manifest(target_store, merged)
+    print(
+        f"Migrated manifest to PostgreSQL: {len(source_manifest.get('files', {}))} file record(s), "
+        f"{len(source_manifest.get('devices', {}))} device(s)."
+    )
 
 
 def get_or_create_device_alias(manifest: dict[str, Any], source_id: str, display_name: str) -> str:
@@ -820,8 +1280,9 @@ def prompt_device_auto_approval(args: argparse.Namespace, source: Device, device
 def should_process_in_watch_mode(args: argparse.Namespace, source: Device) -> bool:
     archive_root = resolve_archive_root(args.archive_root)
     archive_root, manifest_path = make_archive_paths(archive_root)
-    manifest = load_manifest(manifest_path)
-    changed = normalize_manifest_paths(archive_root, manifest)
+    store = create_manifest_store(args, manifest_path)
+    manifest = load_manifest(store)
+    normalize_manifest_paths(archive_root, manifest)
 
     device_alias = get_or_create_device_alias(manifest, source.device_id, source.name)
     devices: dict[str, Any] = manifest.setdefault("devices", {})
@@ -830,7 +1291,7 @@ def should_process_in_watch_mode(args: argparse.Namespace, source: Device) -> bo
 
     if auto_approved:
         # Persist display name/alias schema updates for previously approved devices.
-        save_manifest(manifest_path, manifest)
+        save_manifest(store, manifest)
         return True
 
     approved = prompt_device_auto_approval(args, source, device_alias)
@@ -840,7 +1301,7 @@ def should_process_in_watch_mode(args: argparse.Namespace, source: Device) -> bo
         print(f"Approved {source.name}; starting ingestion.")
     else:
         print(f"Ignored {source.name}; not approved for auto-processing.")
-    save_manifest(manifest_path, manifest)
+    save_manifest(store, manifest)
     return approved
 
 
@@ -859,11 +1320,12 @@ def notify_complete() -> None:
 def process_source(args: argparse.Namespace, source: Device) -> int:
     archive_root = resolve_archive_root(args.archive_root)
     archive_root, manifest_path = make_archive_paths(archive_root)
-    manifest = load_manifest(manifest_path)
+    store = create_manifest_store(args, manifest_path)
+    manifest = load_manifest(store)
     if normalize_manifest_paths(archive_root, manifest):
-        save_manifest(manifest_path, manifest)
+        save_manifest(store, manifest)
     if args.dedupe_mode == "fast" and refresh_fast_index(archive_root, manifest):
-        save_manifest(manifest_path, manifest)
+        save_manifest(store, manifest)
     known_hashes: dict[str, Any] = manifest.get("files", {})
     quick_index_root: dict[str, Any] = manifest.setdefault("quick_index", {})
     fast_index: dict[str, str] = manifest.setdefault("fast_index", {})
@@ -878,11 +1340,11 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
         media_files = find_media_files(source.path)
     except SourceUnavailableError as exc:
         print(str(exc))
-        save_manifest(manifest_path, manifest)
+        save_manifest(store, manifest)
         return 0
     print(f"Media files found: {len(media_files)}")
     if not media_files:
-        save_manifest(manifest_path, manifest)
+        save_manifest(store, manifest)
         return 0
 
     new_items: list[dict[str, Any]] = []
@@ -977,7 +1439,7 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
         )
 
     if quick_index_changed:
-        save_manifest(manifest_path, manifest)
+        save_manifest(store, manifest)
 
     if source_disconnected:
         print(disconnect_reason)
@@ -1056,7 +1518,7 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
                 fast_index[fast_fingerprint] = content_id
             manifest["files"] = known_hashes
             manifest["fast_index"] = fast_index
-            save_manifest(manifest_path, manifest)
+            save_manifest(store, manifest)
             touched_months.add(month_key)
             processed += 1
 
@@ -1187,14 +1649,56 @@ def parse_args() -> argparse.Namespace:
         default="fast",
         help="Duplicate detection mode: 'fast' uses sampled content fingerprints, 'strict' uses full SHA-256.",
     )
+    parser.add_argument(
+        "--storage-backend",
+        choices=("json", "postgres"),
+        default="json",
+        help="Manifest storage backend: 'json' writes manifest.json, 'postgres' stores state in PostgreSQL.",
+    )
+    parser.add_argument(
+        "--database-url",
+        help=(
+            "PostgreSQL connection URL for --storage-backend postgres. "
+            "Falls back to FAQ_NOTES_DATABASE_URL or DATABASE_URL."
+        ),
+    )
+    parser.add_argument(
+        "--account-id",
+        help=(
+            "Logical user/account ID for Postgres record isolation. "
+            "Required for --storage-backend postgres (or set FAQ_NOTES_ACCOUNT_ID)."
+        ),
+    )
+    parser.add_argument(
+        "--migrate-manifest",
+        action="store_true",
+        help=(
+            "One-time import of archive_root/manifest.json into PostgreSQL before running. "
+            "Requires --storage-backend postgres."
+        ),
+    )
+    parser.add_argument(
+        "--migrate-only",
+        action="store_true",
+        help="Exit after --migrate-manifest completes.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
+    args = parse_args()
+    if args.migrate_only and not args.migrate_manifest:
+        raise SystemExit("--migrate-only requires --migrate-manifest.")
+    if args.migrate_manifest:
+        archive_root = resolve_archive_root(args.archive_root)
+        _, manifest_path = make_archive_paths(archive_root)
+        migrate_manifest_to_postgres(args, manifest_path)
+        if args.migrate_only:
+            return
+
     require_tool("ffmpeg")
     require_tool("ffprobe")
 
-    args = parse_args()
     if args.tray:
         args.watch = True
         run_tray_mode(args)
