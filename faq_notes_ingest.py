@@ -74,6 +74,24 @@ SUPPORTED_EXTENSIONS = {
     ".3gp",
 }
 RETRYABLE_ERRORS = (RateLimitError, APIConnectionError, APITimeoutError, TimeoutError)
+ANSI_RESET = "\033[0m"
+ANSI_BOLD = "\033[1m"
+LOG_COLORS = {
+    "info": "\033[36m",
+    "success": "\033[32m",
+    "warning": "\033[33m",
+    "error": "\033[31m",
+    "progress": "\033[34m",
+    "muted": "\033[90m",
+}
+LOG_LABELS = {
+    "info": "INFO",
+    "success": "OK",
+    "warning": "WARN",
+    "error": "ERROR",
+    "progress": "STEP",
+}
+COLOR_OUTPUT_ENABLED = False
 
 
 @dataclass
@@ -81,6 +99,64 @@ class Device:
     device_id: str
     name: str
     path: Path
+
+
+def enable_windows_ansi() -> bool:
+    if os.name != "nt":
+        return True
+    try:
+        kernel32 = ctypes.windll.kernel32
+        std_output_handle = -11
+        enable_virtual_terminal = 0x0004
+        handle = kernel32.GetStdHandle(std_output_handle)
+        if handle in (0, -1):
+            return False
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)) == 0:
+            return False
+        if mode.value & enable_virtual_terminal:
+            return True
+        return bool(kernel32.SetConsoleMode(handle, mode.value | enable_virtual_terminal))
+    except Exception:
+        return False
+
+
+def configure_console_output(no_color: bool = False) -> None:
+    global COLOR_OUTPUT_ENABLED
+    if no_color or os.getenv("NO_COLOR") is not None or not sys.stdout.isatty():
+        COLOR_OUTPUT_ENABLED = False
+        return
+    if os.name == "nt":
+        COLOR_OUTPUT_ENABLED = enable_windows_ansi()
+        return
+    COLOR_OUTPUT_ENABLED = True
+
+
+def color_text(text: str, tone: str = "", bold: bool = False) -> str:
+    if not COLOR_OUTPUT_ENABLED:
+        return text
+    styles: list[str] = []
+    if bold:
+        styles.append(ANSI_BOLD)
+    color_code = LOG_COLORS.get(tone)
+    if color_code:
+        styles.append(color_code)
+    if not styles:
+        return text
+    return f"{''.join(styles)}{text}{ANSI_RESET}"
+
+
+def log_status(kind: str, message: str, *, leading_blank: bool = False) -> None:
+    if leading_blank:
+        print()
+    label = LOG_LABELS.get(kind, "INFO")
+    label_text = color_text(f"[{label}]", tone=kind, bold=True)
+    print(f"{label_text} {message}")
+
+
+def log_detail(label: str, value: Any) -> None:
+    label_text = color_text(f"{label}:", tone="muted", bold=True)
+    print(f"  {label_text} {value}")
 
 
 class SourceUnavailableError(RuntimeError):
@@ -708,7 +784,7 @@ def transcribe_media_file(client: OpenAI, media_path: Path) -> str:
         chunks = chunk_audio(normalized, tmp_dir)
         texts: list[str] = []
         for idx, chunk_path in enumerate(chunks, start=1):
-            print(f"  - Transcribing chunk {idx}/{len(chunks)}: {media_path.name}")
+            log_status("progress", f"Transcribing chunk {idx}/{len(chunks)}: {media_path.name}")
             texts.append(transcribe_part(client, chunk_path))
         return "\n\n".join(t for t in texts if t).strip()
 
@@ -834,7 +910,7 @@ def migrate_manifest_to_postgres(args: argparse.Namespace, manifest_path: Path) 
     if args.storage_backend != "postgres":
         raise SystemExit("--migrate-manifest requires --storage-backend postgres.")
     if not manifest_path.exists():
-        print(f"No local manifest found at {manifest_path}; skipping migration.")
+        log_status("warning", f"No local manifest found at {manifest_path}; skipping migration.")
         return
 
     json_store = JsonManifestStore(manifest_path)
@@ -843,9 +919,10 @@ def migrate_manifest_to_postgres(args: argparse.Namespace, manifest_path: Path) 
     target_manifest = load_manifest(target_store)
     merged = merge_manifest_data(target_manifest, source_manifest)
     save_manifest(target_store, merged)
-    print(
+    log_status(
+        "success",
         f"Migrated manifest to PostgreSQL: {len(source_manifest.get('files', {}))} file record(s), "
-        f"{len(source_manifest.get('devices', {}))} device(s)."
+        f"{len(source_manifest.get('devices', {}))} device(s).",
     )
 
 
@@ -1179,10 +1256,10 @@ def find_media_files(root: Path) -> list[Path]:
 def choose_device_interactive(devices: list[Device]) -> Device | None:
     if not devices:
         return None
-    print("\nDetected devices:")
+    log_status("info", "Detected devices:", leading_blank=True)
     for idx, device in enumerate(devices, start=1):
-        print(f"  {idx}. {device.name}")
-    print("  M. Manual path")
+        print(f"  {idx}. {color_text(device.name, tone='info')}")
+    print(f"  M. {color_text('Manual path', tone='info')}")
     choice = input("Select a device [number/M]: ").strip().lower()
     if choice == "m":
         return None
@@ -1235,7 +1312,8 @@ def copied_filename(captured_at: datetime, file_hash: str, suffix: str) -> str:
 
 def prompt_yes_no(message: str, default_yes: bool = True) -> bool:
     suffix = "[Y/n]" if default_yes else "[y/N]"
-    raw = input(f"{message} {suffix}: ").strip().lower()
+    prompt = color_text(f"{message} {suffix}: ", tone="info", bold=True)
+    raw = input(prompt).strip().lower()
     if not raw:
         return default_yes
     return raw in {"y", "yes"}
@@ -1265,15 +1343,15 @@ def prompt_device_auto_approval(args: argparse.Namespace, source: Device, device
     if args.tray and os.name == "nt":
         return prompt_yes_no_windows(message, "FAQ Notes Tool", default_yes=False)
 
-    print(f"\nDetected new device (approval required): {source.name}")
-    print(f"Device ID: {source.device_id} ({device_alias})")
+    log_status("warning", f"New device detected (approval required): {source.name}", leading_blank=True)
+    log_detail("Device ID", f"{source.device_id} ({device_alias})")
     if sys.stdin.isatty():
         return prompt_yes_no(
             "Approve this device for automatic processing in watch mode?",
             default_yes=False,
         )
 
-    print("Skipping unapproved device: no interactive prompt is available.")
+    log_status("warning", "Skipping unapproved device: no interactive prompt is available.")
     return False
 
 
@@ -1298,9 +1376,9 @@ def should_process_in_watch_mode(args: argparse.Namespace, source: Device) -> bo
     device_meta["auto_approved"] = approved
     if approved:
         device_meta["approved_at_local"] = datetime.now().isoformat(timespec="seconds")
-        print(f"Approved {source.name}; starting ingestion.")
+        log_status("success", f"Approved {source.name}; starting ingestion.")
     else:
-        print(f"Ignored {source.name}; not approved for auto-processing.")
+        log_status("warning", f"Ignored {source.name}; not approved for auto-processing.")
     save_manifest(store, manifest)
     return approved
 
@@ -1332,17 +1410,17 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
     source_quick: dict[str, str] = quick_index_root.setdefault(source.device_id, {})
     device_alias = get_or_create_device_alias(manifest, source.device_id, source.name)
 
-    print(f"\nSource: {source.path}")
-    print(f"Device ID: {source.device_id} ({device_alias})")
-    print(f"Duplicate mode: {args.dedupe_mode}")
+    log_status("info", f"Starting ingest from {source.path}", leading_blank=True)
+    log_detail("Device ID", f"{source.device_id} ({device_alias})")
+    log_detail("Duplicate mode", args.dedupe_mode)
     try:
         ensure_source_available(source)
         media_files = find_media_files(source.path)
     except SourceUnavailableError as exc:
-        print(str(exc))
+        log_status("warning", str(exc))
         save_manifest(store, manifest)
         return 0
-    print(f"Media files found: {len(media_files)}")
+    log_status("info", f"Media files found: {len(media_files)}")
     if not media_files:
         save_manifest(store, manifest)
         return 0
@@ -1373,7 +1451,7 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
         fast_fingerprint = ""
         try:
             if args.dedupe_mode == "fast":
-                print(f"Fingerprinting {idx}/{len(media_files)}: {media_file.name}")
+                log_status("progress", f"Fingerprinting {idx}/{len(media_files)}: {media_file.name}")
                 fast_fingerprint = sampled_file_fingerprint(media_file, stat.st_size)
                 known_by_fingerprint = fast_index.get(fast_fingerprint)
                 if known_by_fingerprint and known_by_fingerprint in known_hashes:
@@ -1382,7 +1460,7 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
                     continue
                 content_id = fast_fingerprint
             else:
-                print(f"Hashing {idx}/{len(media_files)}: {media_file.name}")
+                log_status("progress", f"Hashing {idx}/{len(media_files)}: {media_file.name}")
                 content_id = sha256_file(media_file)
         except OSError as exc:
             source_disconnected = True
@@ -1410,7 +1488,7 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
                 if existing_size == stat.st_size:
                     needs_copy = False
                 else:
-                    print(f"Existing copy size mismatch, recopying: {target_path.name}")
+                    log_status("warning", f"Existing copy size mismatch, recopying: {target_path.name}")
                     target_path.unlink()
             if needs_copy:
                 copy_file_atomic(media_file, target_path, expected_size=stat.st_size)
@@ -1423,7 +1501,7 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
                 source_disconnected = True
                 disconnect_reason = f"Source disconnected while copying {media_file}"
                 break
-            print(f"Failed to copy {media_file.name}: {exc}")
+            log_status("error", f"Failed to copy {media_file.name}: {exc}")
             continue
 
         new_items.append(
@@ -1442,15 +1520,18 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
         save_manifest(store, manifest)
 
     if source_disconnected:
-        print(disconnect_reason)
-        print("Source disconnected mid-run. Already copied/transcribed files are safe; resume by reconnecting.")
+        log_status("warning", disconnect_reason)
+        log_status(
+            "warning",
+            "Source disconnected mid-run. Already copied/transcribed files are safe; resume by reconnecting.",
+        )
 
-    print(f"New files to process: {len(new_items)}")
+    log_status("info", f"New files to process: {len(new_items)}")
     if not new_items:
         return 0
 
     if not args.yes and not args.watch and not prompt_yes_no("Copy and transcribe new files?"):
-        print("Cancelled by user.")
+        log_status("warning", "Cancelled by user.")
         return 0
 
     api_key = os.getenv("OPENAI_API_KEY")
@@ -1459,7 +1540,10 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
 
     requested_workers = max(1, args.workers)
     worker_count = min(requested_workers, len(new_items))
-    print(f"Queued {len(new_items)} file(s) for transcription with {worker_count} worker(s).")
+    log_status(
+        "info",
+        f"Queued {len(new_items)} file(s) for transcription with {worker_count} worker(s).",
+    )
 
     processed = 0
     failed = 0
@@ -1474,12 +1558,16 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
         for index, future in enumerate(as_completed(futures), start=1):
             item = futures[future]
             target_path: Path = item["target_path"]
-            print(f"\n[{index}/{len(new_items)}] Completed task for {target_path.name}")
+            log_status(
+                "success",
+                f"[{index}/{len(new_items)}] Finished task for {target_path.name}",
+                leading_blank=True,
+            )
             try:
                 transcript = future.result()
             except Exception as exc:
                 failed += 1
-                print(f"Failed {target_path.name}: {exc}")
+                log_status("error", f"Failed {target_path.name}: {exc}")
                 continue
 
             captured_at: datetime = item["captured_at"]
@@ -1497,7 +1585,7 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
                 atomic_write_text(transcript_path, transcript.strip(), encoding="utf-8")
             except OSError as exc:
                 failed += 1
-                print(f"Failed to write transcript {transcript_path.name}: {exc}")
+                log_status("error", f"Failed to write transcript {transcript_path.name}: {exc}")
                 continue
 
             known_hashes[content_id] = {
@@ -1525,7 +1613,11 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
     for month_key in sorted(touched_months):
         rebuild_month_outputs(archive_root, manifest, month_key)
 
-    print(f"\nCompleted. Processed {processed} new file(s). Failed {failed} file(s).")
+    log_status(
+        "success",
+        f"Completed ingest. Processed {processed} new file(s). Failed {failed} file(s).",
+        leading_blank=True,
+    )
     notify_complete()
     return processed
 
@@ -1535,18 +1627,18 @@ def poll_watch_cycle(args: argparse.Namespace, seen_ids: set[str]) -> set[str]:
     current_ids = {d.device_id for d in current}
     new_devices = [d for d in current if d.device_id not in seen_ids]
     for device in new_devices:
-        print(f"\nDetected new device: {device.name}")
+        log_status("info", f"Detected new device: {device.name}", leading_blank=True)
         try:
             if should_process_in_watch_mode(args, device):
                 process_source(args, device)
         except Exception as exc:
-            print(f"Error processing {device.path}: {exc}")
+            log_status("error", f"Error processing {device.path}: {exc}")
     return current_ids
 
 
 def run_watch_mode(args: argparse.Namespace, stop_event: threading.Event | None = None) -> None:
-    print("Watch mode enabled.")
-    print("Waiting for newly connected devices. Press Ctrl+C to stop.")
+    log_status("success", "Watch mode enabled.")
+    log_status("info", "Waiting for newly connected devices. Press Ctrl+C to stop.")
     seen_ids = {d.device_id for d in discover_devices()}
     interval = max(2, args.interval)
 
@@ -1579,8 +1671,8 @@ def run_tray_mode(args: argparse.Namespace) -> None:
     except ImportError as exc:
         raise SystemExit("Tray mode requires 'pystray' and 'Pillow'. Install with: pip install pystray pillow") from exc
 
-    print("Tray mode enabled.")
-    print("The app is running in the system tray.")
+    log_status("success", "Tray mode enabled.")
+    log_status("info", "The app is running in the system tray.")
     stop_event = threading.Event()
     watch_thread = threading.Thread(target=run_watch_mode, args=(args, stop_event), daemon=True)
     watch_thread.start()
@@ -1682,11 +1774,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Exit after --migrate-manifest completes.",
     )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable ANSI color output for console logs.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    configure_console_output(args.no_color)
     if args.migrate_only and not args.migrate_manifest:
         raise SystemExit("--migrate-only requires --migrate-manifest.")
     if args.migrate_manifest:
@@ -1716,5 +1814,5 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\nStopped.")
+        log_status("warning", "Stopped.", leading_blank=True)
         sys.exit(130)
