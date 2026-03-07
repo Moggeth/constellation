@@ -148,10 +148,23 @@ Run the realtime voice controller from the system tray:
 python voice_notes_realtime.py --tray
 ```
 
+Realtime session logs now go to `toolbelt/realtime_sessions/<timestamp>/` by default and include:
+
+- native user/assistant transcript lines
+- tool calls and tool results
+- session start/stop/error events
+
+Disable that logging if needed:
+
+```bash
+python voice_notes_realtime.py --no-session-logging
+```
+
 Notes on realtime voices:
 
 - Supported realtime voices are currently `alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`, `shimmer`, `verse`, `marin`, and `cedar`.
 - If you ask the assistant to switch voices mid-session, it now reconnects briefly and continues in the new voice.
+- Voice changes now carry forward recent conversation context instead of starting from a blank slate.
 - Tray mode remembers the default voice, can relaunch the live session without a terminal window, and uses a Constellation-themed starry tray icon.
 
 Check Codex bridge status:

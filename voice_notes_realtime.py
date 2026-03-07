@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +56,7 @@ CHANNELS = 1
 FRAME_MS = 20
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
 WORKSPACE_ROOT = SCRIPT_DIR.parent.resolve()
+DEFAULT_SESSION_LOG_ROOT = SCRIPT_DIR / "toolbelt" / "realtime_sessions"
 NOTES_IMPORT_ERROR: str | None = None
 
 TEXT_FILE_EXTENSIONS = {
@@ -89,6 +91,7 @@ SESSION_INSTRUCTIONS = (
     "If the user asks you to talk faster, slower, shorter, more detailed, or switch voices, call the runtime preference tools. "
     "If the user asks what voices are available, call the voice catalog tool. "
     "If the user explicitly asks you to build, edit, review, or wire up code, use the Codex bridge tools instead of pretending the work is already done. "
+    "For small direct workspace changes like creating a simple file, you can use the local file write tools directly. "
     "Before launching a Codex task that could change files or install software, briefly restate the target repo and intended action. "
     "Use the safest sandbox that still fits the job, and only use danger-full-access if the user clearly wants machine-level changes. "
     "Do not mention internal implementation details unless asked."
@@ -220,6 +223,55 @@ class WorkspaceTools:
             "text": text,
         }
 
+    def write_file(
+        self,
+        relative_path: str,
+        content: str,
+        *,
+        overwrite: bool = True,
+        create_parents: bool = True,
+    ) -> dict[str, Any]:
+        target = ensure_within_root(self.root, self.root / relative_path)
+        if target.exists() and target.is_dir():
+            return {"ok": False, "error": f"Path is a directory: {relative_path}"}
+        if target.exists() and not overwrite:
+            return {"ok": False, "error": f"File already exists: {relative_path}"}
+        if create_parents:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return {
+            "ok": True,
+            "relative_path": str(target.relative_to(self.root)),
+            "bytes_written": len(content.encode("utf-8")),
+            "restart_recommended": target.suffix == ".py",
+        }
+
+    def replace_text(
+        self,
+        relative_path: str,
+        old_text: str,
+        new_text: str,
+        *,
+        count: int = 1,
+    ) -> dict[str, Any]:
+        target = ensure_within_root(self.root, self.root / relative_path)
+        if not target.exists():
+            return {"ok": False, "error": f"File not found: {relative_path}"}
+        if not target.is_file():
+            return {"ok": False, "error": f"Not a file: {relative_path}"}
+        text = target.read_text(encoding="utf-8")
+        replacements = text.count(old_text)
+        if replacements == 0:
+            return {"ok": False, "error": f"Text not found in {relative_path}"}
+        target.write_text(text.replace(old_text, new_text, count), encoding="utf-8")
+        return {
+            "ok": True,
+            "relative_path": str(target.relative_to(self.root)),
+            "replacements_available": replacements,
+            "replacements_applied": min(replacements, count),
+            "restart_recommended": target.suffix == ".py",
+        }
+
     def search(self, query: str, max_results: int = 8, subpath: str | None = None) -> dict[str, Any]:
         base = self.root if subpath is None else ensure_within_root(self.root, self.root / subpath)
         if not base.exists():
@@ -255,6 +307,60 @@ class WorkspaceTools:
                     if len(results) >= max_results:
                         return {"ok": True, "results": results}
         return {"ok": True, "results": results}
+
+
+class SessionLogger:
+    def __init__(self, *, root: Path, enabled: bool) -> None:
+        self.enabled = enabled
+        self.root = root.resolve()
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.session_dir = self.root / timestamp
+        self.events_path = self.session_dir / "events.jsonl"
+        self.transcript_path = self.session_dir / "transcript.md"
+        if self.enabled:
+            self.session_dir.mkdir(parents=True, exist_ok=True)
+
+    def log_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        record = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "type": event_type,
+            "payload": payload,
+        }
+        with self.events_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def log_transcript(self, speaker: str, text: str) -> None:
+        if not self.enabled or not text.strip():
+            return
+        line = f"[{datetime.now().strftime('%H:%M:%S')}] {speaker}: {text.strip()}\n"
+        with self.transcript_path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+
+
+def build_history_reconnect_prompt(
+    conversation_history: list[dict[str, str]],
+    *,
+    follow_up: str,
+    max_turns: int = 12,
+    max_chars: int = 6000,
+) -> str:
+    recent_turns = conversation_history[-max_turns:]
+    chunks: list[str] = []
+    for item in recent_turns:
+        role = item.get("role", "assistant").capitalize()
+        text = item.get("text", "").strip()
+        if text:
+            chunks.append(f"{role}: {text}")
+    history_text = "\n".join(chunks)
+    if len(history_text) > max_chars:
+        history_text = history_text[-max_chars:]
+    return (
+        "Conversation continuity context. Do not repeat this context back unless useful.\n"
+        f"{history_text}\n\n"
+        f"Continue seamlessly from there. {follow_up}"
+    ).strip()
 
 
 class RealtimeAssistantContext:
@@ -356,6 +462,38 @@ class RealtimeAssistantContext:
             },
             {
                 "type": "function",
+                "name": "write_file",
+                "description": "Create or overwrite one UTF-8 text file inside the current workspace.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "relative_path": {"type": "string"},
+                        "content": {"type": "string"},
+                        "overwrite": {"type": "boolean"},
+                        "create_parents": {"type": "boolean"},
+                    },
+                    "required": ["relative_path", "content"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": "replace_text_in_file",
+                "description": "Replace a text snippet inside one UTF-8 text file in the workspace.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "relative_path": {"type": "string"},
+                        "old_text": {"type": "string"},
+                        "new_text": {"type": "string"},
+                        "count": {"type": "integer", "minimum": 1, "maximum": 100},
+                    },
+                    "required": ["relative_path", "old_text", "new_text"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
                 "name": "get_codex_bridge_status",
                 "description": "Check whether Constellation can launch Codex CLI from this machine right now.",
                 "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -432,6 +570,18 @@ class RealtimeAssistantContext:
                     "type": "object",
                     "properties": {"task_id": {"type": "string"}},
                     "required": ["task_id"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": "restart_runtime_session",
+                "description": "Restart the live runtime session after the assistant warns the user. Use when code or configuration changes need a reconnect.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reason": {"type": "string"},
+                    },
                     "additionalProperties": False,
                 },
             },
@@ -591,6 +741,20 @@ class RealtimeAssistantContext:
             return self.workspace.read_file(
                 relative_path=str(args.get("relative_path", "")),
                 max_chars=int(args.get("max_chars", 6000)),
+            )
+        if name == "write_file":
+            return self.workspace.write_file(
+                relative_path=str(args.get("relative_path", "")),
+                content=str(args.get("content", "")),
+                overwrite=bool(args.get("overwrite", True)),
+                create_parents=bool(args.get("create_parents", True)),
+            )
+        if name == "replace_text_in_file":
+            return self.workspace.replace_text(
+                relative_path=str(args.get("relative_path", "")),
+                old_text=str(args.get("old_text", "")),
+                new_text=str(args.get("new_text", "")),
+                count=int(args.get("count", 1)),
             )
         if name == "get_codex_bridge_status":
             return self.codex_bridge.status()
@@ -910,6 +1074,8 @@ async def run_single_voice_session(
     args: argparse.Namespace,
     assistant_context: RealtimeAssistantContext,
     runtime_preferences: RuntimePreferences,
+    session_logger: SessionLogger,
+    conversation_history: list[dict[str, str]],
     *,
     prompt: str | None,
     greeting_enabled: bool,
@@ -934,9 +1100,20 @@ async def run_single_voice_session(
     function_call_names: dict[str, str] = {}
     thinking_indicator = ThinkingIndicator(enabled=runtime_preferences.thinking_sound_enabled)
     reconnect_prompt: str | None = None
+    pending_restart_announcement: str | None = None
+    restart_after_response = False
 
     print(f"Connecting to realtime model: {args.model}")
     print("Press Ctrl+C to quit.")
+    session_logger.log_event(
+        "session_start",
+        {
+            "model": args.model,
+            "voice": runtime_preferences.voice,
+            "greeting_enabled": greeting_enabled,
+            "prompt_injected": bool(prompt),
+        },
+    )
 
     async with client.realtime.connect(model=args.model) as conn:
         await conn.session.update(session=build_session_payload(args, assistant_context, runtime_preferences))
@@ -966,9 +1143,11 @@ async def run_single_voice_session(
                 event_type = getattr(event, "type", "")
 
                 if event_type == "session.created":
+                    session_logger.log_event("session_created", {"event_type": event_type})
                     print("[session] created")
                     continue
                 if event_type == "session.updated":
+                    session_logger.log_event("session_updated", {"voice": runtime_preferences.voice})
                     print("[session] updated and ready")
                     continue
                 if event_type == "input_audio_buffer.speech_started":
@@ -983,6 +1162,8 @@ async def run_single_voice_session(
                     transcript = event.transcript.strip()
                     if transcript and event.item_id not in seen_user_transcripts:
                         seen_user_transcripts.add(event.item_id)
+                        conversation_history.append({"role": "user", "text": transcript})
+                        session_logger.log_transcript("user", transcript)
                         print(f"[you] {transcript}")
                     continue
                 if event_type == "response.created":
@@ -1006,6 +1187,8 @@ async def run_single_voice_session(
                     thinking_indicator.stop()
                     transcript = event.transcript.strip()
                     if transcript:
+                        conversation_history.append({"role": "assistant", "text": transcript})
+                        session_logger.log_transcript("assistant", transcript)
                         print(f"[assistant] {transcript}")
                         assistant_output_received.set()
                     assistant_partial.pop(event.item_id, None)
@@ -1015,6 +1198,8 @@ async def run_single_voice_session(
                     if args.no_audio_output:
                         text = event.text.strip()
                         if text:
+                            conversation_history.append({"role": "assistant", "text": text})
+                            session_logger.log_transcript("assistant", text)
                             print(f"[assistant] {text}")
                             assistant_output_received.set()
                     continue
@@ -1026,6 +1211,10 @@ async def run_single_voice_session(
                         tool_result = {"ok": False, "error": f"Invalid tool arguments: {exc}"}
                     else:
                         print(f"[tool] {tool_name}({json.dumps(tool_args)})")
+                        session_logger.log_event(
+                            "tool_call_started",
+                            {"tool_name": tool_name, "arguments": tool_args},
+                        )
                         if tool_name == "get_runtime_preferences":
                             tool_result = {
                                 "speech_speed": runtime_preferences.speech_speed,
@@ -1067,8 +1256,11 @@ async def run_single_voice_session(
                                     continue
                                 if requested_voice != runtime_preferences.voice:
                                     runtime_preferences.voice = requested_voice
-                                    reconnect_prompt = (
-                                        f"Briefly confirm that you switched to the {requested_voice} voice and ask how you can help next."
+                                    reconnect_prompt = build_history_reconnect_prompt(
+                                        conversation_history,
+                                        follow_up=(
+                                            f"Briefly confirm that you switched to the {requested_voice} voice and then continue helping seamlessly."
+                                        ),
                                     )
                             runtime_preferences.clamp()
                             thinking_indicator.enabled = runtime_preferences.thinking_sound_enabled
@@ -1088,10 +1280,30 @@ async def run_single_voice_session(
                             else:
                                 tool_result["reconnect_required"] = True
                                 tool_result["note"] = VOICE_CHANGE_REQUIRES_RECONNECT
+                        elif tool_name == "restart_runtime_session":
+                            reason = normalize_optional_string(tool_args.get("reason")) or "A runtime refresh was requested."
+                            reconnect_prompt = build_history_reconnect_prompt(
+                                conversation_history,
+                                follow_up=(
+                                    f"Briefly tell the user you restarted successfully and continue seamlessly. Context for restart: {reason}"
+                                ),
+                            )
+                            pending_restart_announcement = (
+                                "Briefly tell the user you are restarting now, that it should only take a couple of seconds, and that you will be right back."
+                            )
+                            tool_result = {
+                                "ok": True,
+                                "reconnect_required": True,
+                                "note": reason,
+                            }
                         elif tool_name == "get_available_voices":
                             tool_result = build_voice_catalog(runtime_preferences.voice)
                         else:
                             tool_result = assistant_context.execute_tool(tool_name, tool_args)
+                    session_logger.log_event(
+                        "tool_call_completed",
+                        {"tool_name": tool_name, "result": tool_result},
+                    )
                     await conn.conversation.item.create(
                         item={
                             "type": "function_call_output",
@@ -1100,11 +1312,23 @@ async def run_single_voice_session(
                         }
                     )
                     if reconnect_prompt is not None:
+                        if pending_restart_announcement is not None:
+                            restart_after_response = True
+                            await conn.response.create(
+                                response={
+                                    "output_modalities": ["audio"],
+                                    "instructions": pending_restart_announcement,
+                                }
+                            )
+                            pending_restart_announcement = None
+                            continue
                         break
                     await conn.response.create(response={"output_modalities": ["audio"]})
                     continue
                 if event_type == "response.done":
                     thinking_indicator.stop()
+                    if restart_after_response:
+                        break
                     if args.greeting_only and assistant_output_received.is_set():
                         break
                     if prompt and assistant_output_received.is_set() and args.no_mic:
@@ -1112,6 +1336,10 @@ async def run_single_voice_session(
                     continue
                 if event_type == "error":
                     thinking_indicator.stop()
+                    session_logger.log_event(
+                        "session_error",
+                        {"message": getattr(event.error, "message", "Unknown realtime error")},
+                    )
                     print(f"[error] {event.error.message}")
                     if args.greeting_only or args.prompt:
                         break
@@ -1123,10 +1351,19 @@ async def run_single_voice_session(
                     await task
             await mic.stop()
             await player.stop()
+            session_logger.log_event(
+                "session_stop",
+                {"voice": runtime_preferences.voice, "reconnect_requested": bool(reconnect_prompt)},
+            )
     return reconnect_prompt
 
 
 async def run_voice_chat(args: argparse.Namespace) -> None:
+    session_logger = SessionLogger(
+        root=Path(args.session_log_root).resolve(),
+        enabled=not args.no_session_logging,
+    )
+    conversation_history: list[dict[str, str]] = []
     assistant_context = RealtimeAssistantContext(
         workspace_root=Path(args.workspace_root).resolve(),
         archive_root=Path(args.archive_root).resolve(),
@@ -1157,6 +1394,8 @@ async def run_voice_chat(args: argparse.Namespace) -> None:
             args,
             assistant_context,
             runtime_preferences,
+            session_logger,
+            conversation_history,
             prompt=prompt,
             greeting_enabled=greeting_enabled,
         )
@@ -1191,6 +1430,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-mic", action="store_true", help="Do not capture microphone input.")
     parser.add_argument("--no-audio-output", action="store_true", help="Do not play assistant audio; print text only.")
     parser.add_argument("--no-thinking-sound", action="store_true", help="Disable the local thinking indicator sound.")
+    parser.add_argument(
+        "--session-log-root",
+        default=str(DEFAULT_SESSION_LOG_ROOT),
+        help="Directory for transcript and tool-call logs.",
+    )
+    parser.add_argument("--no-session-logging", action="store_true", help="Disable local transcript and tool-call logging.")
     parser.add_argument(
         "--codex-command",
         default=DEFAULT_CODEX_COMMAND,
