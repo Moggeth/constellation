@@ -147,6 +147,20 @@ class IgnoreErrors:
         return True
 
 
+def make_voice_action(controller: "RealtimeTrayController", voice: str) -> Any:
+    def action(icon: Any, item: Any) -> None:
+        controller.select_voice(icon, item, voice)
+
+    return action
+
+
+def make_voice_checked(controller: "RealtimeTrayController", voice: str) -> Any:
+    def checked(item: Any) -> bool:
+        return controller.settings.voice == voice
+
+    return checked
+
+
 class RealtimeTrayController:
     def __init__(self, args: Any) -> None:
         self.args = args
@@ -357,8 +371,8 @@ def run_realtime_tray(args: Any) -> None:
         *[
             pystray.MenuItem(
                 voice,
-                lambda icon, item, selected_voice=voice: controller.select_voice(icon, item, selected_voice),
-                checked=lambda item, selected_voice=voice: controller.settings.voice == selected_voice,
+                make_voice_action(controller, voice),
+                checked=make_voice_checked(controller, voice),
             )
             for voice in AVAILABLE_REALTIME_VOICES
         ]
