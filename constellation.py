@@ -12,9 +12,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 TOOLBELT_REGISTRY = SCRIPT_DIR / "toolbelt" / "registry.json"
 
 
-def run_script(filename: str) -> int:
+def run_script(filename: str, forwarded_args: list[str]) -> int:
     script_path = SCRIPT_DIR / filename
-    sys.argv = [str(script_path), *sys.argv[2:]]
+    sys.argv = [str(script_path), *forwarded_args]
     runpy.run_path(str(script_path), run_name="__main__")
     return 0
 
@@ -69,14 +69,11 @@ def main() -> int:
     args, unknown = parser.parse_known_args()
 
     if args.command == "chat":
-        sys.argv = [sys.argv[0], *unknown]
-        return run_script("voice_notes_chat.py")
+        return run_script("voice_notes_chat.py", unknown)
     if args.command == "ingest":
-        sys.argv = [sys.argv[0], *unknown]
-        return run_script("voice_notes_ingest.py")
+        return run_script("voice_notes_ingest.py", unknown)
     if args.command == "realtime":
-        sys.argv = [sys.argv[0], *unknown]
-        return run_script("voice_notes_realtime.py")
+        return run_script("voice_notes_realtime.py", unknown)
     if args.command == "toolbelt":
         if args.toolbelt_command == "list":
             return cmd_toolbelt_list()
