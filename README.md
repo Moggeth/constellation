@@ -4,8 +4,15 @@ Notes archive repo with two entrypoints:
 
 - `faq_notes_ingest.py` for importing and transcribing recordings
 - `faq_notes_chat.py` for chatting with the archive and turning notes into actionable outputs
+- `voice_notes_realtime.py` for optional live speech-to-speech use
 
 The name is legacy. In practice this repo is broader than FAQ capture and is intended to be the local notes/archive layer for future tooling.
+
+Preferred entrypoints now use `voice_notes_*` aliases:
+
+- `voice_notes_ingest.py`
+- `voice_notes_chat.py`
+- `voice_notes_realtime.py`
 
 ## What it does
 
@@ -24,6 +31,7 @@ The name is legacy. In practice this repo is broader than FAQ capture and is int
 - `ffmpeg` and `ffprobe` on `PATH`
 - `OPENAI_API_KEY` environment variable
 - Python package: `openai`
+- Optional for realtime voice mode: `sounddevice`
 - Optional for PostgreSQL backend: `psycopg[binary]`
 - Optional for tray mode on Windows, macOS, and Linux: `pystray`, `Pillow`
 
@@ -45,6 +53,12 @@ For tray mode:
 pip install pystray pillow
 ```
 
+For realtime voice mode:
+
+```bash
+pip install sounddevice
+```
+
 ## Usage
 
 Run from this folder:
@@ -57,6 +71,12 @@ Open the chat interface:
 
 ```bash
 python faq_notes_chat.py
+```
+
+Preferred alias:
+
+```bash
+python voice_notes_chat.py
 ```
 
 Import first, then open chat:
@@ -77,6 +97,29 @@ Inspect the archive without calling GPT:
 python faq_notes_chat.py --stats
 python faq_notes_chat.py --list-recent 5
 ```
+
+Start realtime voice chat:
+
+```bash
+python voice_notes_realtime.py
+```
+
+List supported realtime voices:
+
+```bash
+python voice_notes_realtime.py --list-voices
+```
+
+Start with a specific voice:
+
+```bash
+python voice_notes_realtime.py --voice verse
+```
+
+Notes on realtime voices:
+
+- Supported realtime voices are currently `alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`, `shimmer`, `verse`, `marin`, and `cedar`.
+- If you ask the assistant to switch voices mid-session, it now reconnects briefly and continues in the new voice.
 
 Run from project root:
 
@@ -220,7 +263,12 @@ Notes on archive root:
 faq_notes_tool/
   faq_notes_ingest.py
   faq_notes_chat.py
+  voice_notes_ingest.py
+  voice_notes_chat.py
+  voice_notes_realtime.py
+  voice_notes_toolbelt.py
   README.md
+  toolbelt/
   faq_notes/
     manifest.json
     YYYY-MM/
@@ -245,3 +293,11 @@ faq_notes_tool/
 - `/refresh`
 - `/reset`
 - `/exit`
+
+## Toolbelt Direction
+
+The repo now includes a small `toolbelt/` seed plus `voice_notes_toolbelt.py` as the start of a reusable local-tool layer. The current split is:
+
+- notes/archive behavior stays here
+- reusable runtime controls and voice metadata begin moving into the toolbelt
+- broader agent/tool growth can be extracted there later without re-splitting the notes archive itself
