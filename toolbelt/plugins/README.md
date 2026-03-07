@@ -7,6 +7,7 @@ Expected use:
 - wrappers around local CLIs
 - integrations with external services such as Slack
 - adapters for coding agents and automation tools
+- queueable bridges like the Codex CLI runner
 
 Extraction rule:
 

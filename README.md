@@ -24,6 +24,8 @@ Top-level launcher:
 python constellation.py chat
 python constellation.py ingest --yes
 python constellation.py realtime --list-voices
+python constellation.py realtime --tray
+python constellation.py codex status
 python constellation.py toolbelt list
 ```
 
@@ -48,6 +50,7 @@ python constellation.py toolbelt list
 - Optional for realtime voice mode: `sounddevice`
 - Optional for PostgreSQL backend: `psycopg[binary]`
 - Optional for tray mode on Windows, macOS, and Linux: `pystray`, `Pillow`
+- Optional for voice-driven coding tasks: a working `codex` CLI command on `PATH` or configured via `CONSTELLATION_CODEX_COMMAND`
 
 Install package:
 
@@ -132,10 +135,41 @@ Start with a specific voice:
 python voice_notes_realtime.py --voice verse
 ```
 
+Run the realtime voice controller from the system tray:
+
+```bash
+python voice_notes_realtime.py --tray
+```
+
 Notes on realtime voices:
 
 - Supported realtime voices are currently `alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`, `shimmer`, `verse`, `marin`, and `cedar`.
 - If you ask the assistant to switch voices mid-session, it now reconnects briefly and continues in the new voice.
+- Tray mode remembers the default voice, can relaunch the live session without a terminal window, and uses a Constellation-themed starry tray icon.
+
+Check Codex bridge status:
+
+```bash
+python constellation.py codex status
+```
+
+List candidate repos for Codex work:
+
+```bash
+python constellation.py codex repos
+```
+
+Queue a Codex task against a repo:
+
+```bash
+python constellation.py codex run --repo auto_roster "Review the repo and implement the requested change."
+```
+
+Inspect recent Codex runs:
+
+```bash
+python constellation.py codex runs
+```
 
 Run from project root:
 
@@ -321,4 +355,5 @@ The repo now includes a small `toolbelt/` seed plus `voice_notes_toolbelt.py` as
 
 - notes/archive behavior stays here
 - reusable runtime controls and voice metadata begin moving into the toolbelt
+- Codex CLI queueing and run state now live in the toolbelt boundary
 - broader agent/tool growth can be extracted there later without re-splitting the notes archive itself

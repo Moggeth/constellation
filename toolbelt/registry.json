@@ -19,9 +19,10 @@
       "kind": "interface",
       "status": "active",
       "entrypoints": [
-        "voice_notes_realtime.py"
+        "voice_notes_realtime.py",
+        "constellation_realtime_tray.py"
       ],
-      "description": "Live speech-to-speech interface with workspace tools, notes tools, and runtime voice controls."
+      "description": "Live speech-to-speech interface with workspace tools, notes tools, runtime voice controls, and an optional starry tray controller."
     },
     {
       "name": "runtime_voice_controls",
@@ -34,10 +35,12 @@
     },
     {
       "name": "codex_cli_bridge",
-      "kind": "planned",
-      "status": "planned",
-      "entrypoints": [],
-      "description": "Planned bridge for voice-driven coding tasks through Codex CLI and GPT-5.4 workflows."
+      "kind": "toolbelt",
+      "status": "active",
+      "entrypoints": [
+        "constellation_codex.py"
+      ],
+      "description": "Bridge for voice-driven coding tasks through Codex CLI with repo discovery, queued runs, and GPT-5.4-oriented defaults."
     }
   ]
 }

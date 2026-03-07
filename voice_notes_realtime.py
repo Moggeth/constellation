@@ -25,6 +25,14 @@ from faq_notes_chat import (
     NotesIndex,
     compact_text,
 )
+from constellation_codex import (
+    ALLOWED_APPROVAL_MODES,
+    ALLOWED_SANDBOXES,
+    DEFAULT_CODEX_COMMAND,
+    DEFAULT_CODEX_MODEL,
+    CodexBridgeManager,
+)
+from constellation_realtime_tray import run_realtime_tray
 from voice_notes_toolbelt import (
     AVAILABLE_REALTIME_VOICES,
     DEFAULT_SPEECH_SPEED,
@@ -74,6 +82,9 @@ SESSION_INSTRUCTIONS = (
     "Use tools before claiming specifics about notes or project files. "
     "If the user asks you to talk faster, slower, shorter, more detailed, or switch voices, call the runtime preference tools. "
     "If the user asks what voices are available, call the voice catalog tool. "
+    "If the user explicitly asks you to build, edit, review, or wire up code, use the Codex bridge tools instead of pretending the work is already done. "
+    "Before launching a Codex task that could change files or install software, briefly restate the target repo and intended action. "
+    "Use the safest sandbox that still fits the job, and only use danger-full-access if the user clearly wants machine-level changes. "
     "Do not mention internal implementation details unless asked."
 )
 
@@ -241,10 +252,18 @@ class WorkspaceTools:
 
 
 class RealtimeAssistantContext:
-    def __init__(self, *, workspace_root: Path, archive_root: Path, ingest_script: Path) -> None:
+    def __init__(
+        self,
+        *,
+        workspace_root: Path,
+        archive_root: Path,
+        ingest_script: Path,
+        codex_bridge: CodexBridgeManager,
+    ) -> None:
         self.workspace = WorkspaceTools(workspace_root)
         self.archive_root = archive_root.resolve()
         self.ingest_script = ingest_script.resolve()
+        self.codex_bridge = codex_bridge
         self.notes_index = NotesIndex(self.archive_root) if NotesIndex is not None else None
 
     def tool_definitions(self) -> list[dict[str, Any]]:
@@ -324,6 +343,87 @@ class RealtimeAssistantContext:
                         "max_chars": {"type": "integer", "minimum": 200, "maximum": 20000},
                     },
                     "required": ["relative_path"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": "get_codex_bridge_status",
+                "description": "Check whether Constellation can launch Codex CLI from this machine right now.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+            {
+                "type": "function",
+                "name": "list_codex_repositories",
+                "description": "List likely repo targets for Codex CLI work in the current workspace.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": "start_codex_task",
+                "description": "Queue a Codex CLI task against a chosen repo or directory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {"type": "string"},
+                        "repo_name_or_path": {"type": "string"},
+                        "title": {"type": "string"},
+                        "model": {"type": "string"},
+                        "sandbox": {
+                            "type": "string",
+                            "enum": list(ALLOWED_SANDBOXES),
+                            "description": "Codex sandbox mode.",
+                        },
+                        "approval_mode": {
+                            "type": "string",
+                            "enum": list(ALLOWED_APPROVAL_MODES),
+                            "description": "Codex approval mode.",
+                        },
+                        "add_dirs": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional extra directories to expose to Codex.",
+                        },
+                    },
+                    "required": ["prompt"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": "get_codex_task_status",
+                "description": "Read the latest status of one queued Codex CLI task.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"task_id": {"type": "string"}},
+                    "required": ["task_id"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": "list_codex_tasks",
+                "description": "List recent Codex CLI tasks queued through Constellation.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 30}},
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": "cancel_codex_task",
+                "description": "Cancel a running Codex CLI task.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"task_id": {"type": "string"}},
+                    "required": ["task_id"],
                     "additionalProperties": False,
                 },
             },
@@ -433,6 +533,40 @@ class RealtimeAssistantContext:
                 relative_path=str(args.get("relative_path", "")),
                 max_chars=int(args.get("max_chars", 6000)),
             )
+        if name == "get_codex_bridge_status":
+            return self.codex_bridge.status()
+        if name == "list_codex_repositories":
+            return {"items": self.codex_bridge.discover_repositories(max_repos=int(args.get("limit", 20)))}
+        if name == "start_codex_task":
+            try:
+                task = self.codex_bridge.submit_task(
+                    prompt=str(args.get("prompt", "")),
+                    repo_name_or_path=normalize_optional_string(args.get("repo_name_or_path")),
+                    title=normalize_optional_string(args.get("title")),
+                    model=normalize_optional_string(args.get("model")),
+                    sandbox=str(args.get("sandbox", "workspace-write")),
+                    approval_mode=str(args.get("approval_mode", "never")),
+                    add_dirs=[
+                        str(item)
+                        for item in args.get("add_dirs", [])
+                        if normalize_optional_string(str(item)) is not None
+                    ],
+                )
+            except (OSError, ValueError, FileNotFoundError, NotADirectoryError) as exc:
+                return {"ok": False, "error": str(exc)}
+            return {"ok": True, "task": task}
+        if name == "get_codex_task_status":
+            try:
+                return self.codex_bridge.get_task_status(str(args.get("task_id", "")))
+            except FileNotFoundError as exc:
+                return {"ok": False, "error": str(exc)}
+        if name == "list_codex_tasks":
+            return self.codex_bridge.list_tasks(limit=int(args.get("limit", 10)))
+        if name == "cancel_codex_task":
+            try:
+                return self.codex_bridge.cancel_task(str(args.get("task_id", "")))
+            except FileNotFoundError as exc:
+                return {"ok": False, "error": str(exc)}
 
         if self.notes_index is None:
             return {"ok": False, "error": f"Notes tools unavailable: {NOTES_IMPORT_ERROR or 'unknown import error'}"}
@@ -898,6 +1032,11 @@ async def run_voice_chat(args: argparse.Namespace) -> None:
         workspace_root=Path(args.workspace_root).resolve(),
         archive_root=Path(args.archive_root).resolve(),
         ingest_script=Path(args.ingest_script).resolve(),
+        codex_bridge=CodexBridgeManager(
+            workspace_root=Path(args.workspace_root).resolve(),
+            codex_command=args.codex_command,
+            default_model=args.codex_model,
+        ),
     )
     runtime_preferences = RuntimePreferences(
         speech_speed=args.speech_speed,
@@ -939,12 +1078,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-device", help="Optional sounddevice output device name or index.")
     parser.add_argument("--list-models", action="store_true", help="List realtime/audio-capable models visible to this account and exit.")
     parser.add_argument("--list-devices", action="store_true", help="List local audio devices and exit.")
+    parser.add_argument("--tray", action="store_true", help="Run the Constellation realtime voice controller in the system tray.")
+    parser.add_argument("--tray-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--greeting-only", action="store_true", help="Connect, request the initial greeting, print it, and exit.")
     parser.add_argument("--prompt", help="Inject one text prompt after connect, useful for testing tools without a mic.")
     parser.add_argument("--no-greeting", action="store_true", help="Do not make the assistant greet on startup.")
     parser.add_argument("--no-mic", action="store_true", help="Do not capture microphone input.")
     parser.add_argument("--no-audio-output", action="store_true", help="Do not play assistant audio; print text only.")
     parser.add_argument("--no-thinking-sound", action="store_true", help="Disable the local thinking indicator sound.")
+    parser.add_argument(
+        "--codex-command",
+        default=DEFAULT_CODEX_COMMAND,
+        help=f"Codex executable or alias for bridge tasks (default: {DEFAULT_CODEX_COMMAND}).",
+    )
+    parser.add_argument(
+        "--codex-model",
+        default=DEFAULT_CODEX_MODEL,
+        help=f"Default Codex model for bridge tasks (default: {DEFAULT_CODEX_MODEL}).",
+    )
     return parser
 
 
@@ -986,6 +1137,9 @@ async def async_main(args: argparse.Namespace) -> int:
         return 0
     if args.list_devices:
         print_audio_devices()
+        return 0
+    if args.tray and not args.tray_child:
+        run_realtime_tray(args)
         return 0
 
     args.voice = normalize_voice_name(args.voice) or DEFAULT_VOICE

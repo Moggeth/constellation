@@ -5,6 +5,9 @@ __pycache__/
 # Generated personal archive/output data
 faq_notes/*
 !faq_notes/.gitkeep
+toolbelt/codex_runs/
+toolbelt/realtime_tray_settings.json
+toolbelt/realtime_voice.log
 
 # Ignore audio files to keep repo size manageable
 *.mp3

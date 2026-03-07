@@ -54,6 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("chat", help="Open the Constellation notes chat.")
     subparsers.add_parser("ingest", help="Import and transcribe new recordings.")
     subparsers.add_parser("realtime", help="Start the live speech-to-speech interface.")
+    subparsers.add_parser("codex", help="Inspect or queue Codex CLI tasks through Constellation.")
 
     toolbelt_parser = subparsers.add_parser("toolbelt", help="Inspect the Constellation toolbelt registry.")
     toolbelt_subparsers = toolbelt_parser.add_subparsers(dest="toolbelt_command", required=True)
@@ -74,6 +75,8 @@ def main() -> int:
         return run_script("voice_notes_ingest.py", unknown)
     if args.command == "realtime":
         return run_script("voice_notes_realtime.py", unknown)
+    if args.command == "codex":
+        return run_script("constellation_codex.py", unknown)
     if args.command == "toolbelt":
         if args.toolbelt_command == "list":
             return cmd_toolbelt_list()
