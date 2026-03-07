@@ -18,7 +18,9 @@ Target workflow:
 Current implementation:
 
 - `constellation.py codex ...` exposes repo discovery, bridge status, task queueing, task status, and cancellation.
+- `constellation.py ideas ...` exposes note mining and Codex prompt drafting from captured ideas.
 - `voice_notes_realtime.py` can call the Codex bridge from live voice sessions.
+- `voice_notes_realtime.py` can now mine notes for ideas and queue Codex work directly from a chosen idea.
 - `voice_notes_realtime.py --tray` starts a starry tray controller that can launch or stop the realtime voice session and switch default voices.
 
 Constraints to preserve:

@@ -23,6 +23,7 @@ Top-level launcher:
 ```bash
 python constellation.py chat
 python constellation.py ingest --yes
+python constellation.py ideas mine
 python constellation.py realtime --list-voices
 python constellation.py realtime --tray
 python constellation.py codex status
@@ -51,6 +52,12 @@ python constellation.py toolbelt list
 - Optional for PostgreSQL backend: `psycopg[binary]`
 - Optional for tray mode on Windows, macOS, and Linux: `pystray`, `Pillow`
 - Optional for voice-driven coding tasks: a working `codex` CLI command on `PATH` or configured via `CONSTELLATION_CODEX_COMMAND`
+
+Codex CLI install used on this machine:
+
+```bash
+"C:\Program Files\nodejs\npm.cmd" install -g @openai/codex
+```
 
 Install package:
 
@@ -165,10 +172,35 @@ Queue a Codex task against a repo:
 python constellation.py codex run --repo auto_roster "Review the repo and implement the requested change."
 ```
 
+If your current shell has not picked up the npm install path yet, point Constellation at the installed binary explicitly:
+
+```bash
+set CONSTELLATION_CODEX_COMMAND=C:\Users\mog\AppData\Roaming\npm\codex.cmd
+python constellation.py codex status
+```
+
 Inspect recent Codex runs:
 
 ```bash
 python constellation.py codex runs
+```
+
+Mine notes for likely build ideas:
+
+```bash
+python constellation.py ideas mine --limit 5
+```
+
+Focus the mining pass on a topic:
+
+```bash
+python constellation.py ideas mine --query "robotics arm" --limit 3
+```
+
+Draft a Codex prompt from one chosen idea:
+
+```bash
+python constellation.py ideas prompt --title "Left arm control stack" --summary "Build the first left arm subsystem..." --source-note-id 20260301_101530_ab12cd34 --repo vibe_coded_wheelchair
 ```
 
 Run from project root:
@@ -355,5 +387,6 @@ The repo now includes a small `toolbelt/` seed plus `voice_notes_toolbelt.py` as
 
 - notes/archive behavior stays here
 - reusable runtime controls and voice metadata begin moving into the toolbelt
+- note mining now turns captured ideas into build candidates and Codex-ready prompts
 - Codex CLI queueing and run state now live in the toolbelt boundary
 - broader agent/tool growth can be extracted there later without re-splitting the notes archive itself

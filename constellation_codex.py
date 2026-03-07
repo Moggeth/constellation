@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import threading
@@ -15,12 +16,21 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 RUNS_ROOT = SCRIPT_DIR / "toolbelt" / "codex_runs"
-DEFAULT_CODEX_COMMAND = os.getenv("CONSTELLATION_CODEX_COMMAND", "codex")
+APPDATA_DIR = Path(os.getenv("APPDATA", ""))
+DEFAULT_NATIVE_CODEX_PATH = APPDATA_DIR / "npm" / "codex.cmd"
+DEFAULT_NODE_DIR = Path(r"C:\Program Files\nodejs")
+DEFAULT_CODEX_COMMAND = os.getenv(
+    "CONSTELLATION_CODEX_COMMAND",
+    str(DEFAULT_NATIVE_CODEX_PATH if DEFAULT_NATIVE_CODEX_PATH.exists() else "codex"),
+)
 DEFAULT_CODEX_MODEL = os.getenv("CONSTELLATION_CODEX_MODEL", "gpt-5.4")
 DEFAULT_SANDBOX = os.getenv("CONSTELLATION_CODEX_SANDBOX", "workspace-write")
 DEFAULT_APPROVAL_MODE = os.getenv("CONSTELLATION_CODEX_APPROVAL_MODE", "never")
+DEFAULT_PROVIDER = os.getenv("CONSTELLATION_CODEX_PROVIDER", "native")
+DEFAULT_WSL_DISTRO = os.getenv("CONSTELLATION_CODEX_WSL_DISTRO", "Ubuntu-22.04")
 ALLOWED_SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
 ALLOWED_APPROVAL_MODES = ("untrusted", "on-request", "never")
+ALLOWED_PROVIDERS = ("native", "wsl")
 ACTIVE_STATUSES = {"starting", "running"}
 
 
@@ -48,6 +58,14 @@ def validate_choice(value: str, allowed: tuple[str, ...], label: str) -> str:
     if normalized not in allowed:
         raise ValueError(f"Unsupported {label} '{value}'. Allowed values: {', '.join(allowed)}")
     return normalized
+
+
+def looks_like_completed_run(last_message: str | None, json_tail: str | None) -> bool:
+    if not last_message:
+        return False
+    if not json_tail:
+        return False
+    return '"turn.completed"' in json_tail or '"item.completed"' in json_tail
 
 
 @dataclass
@@ -86,14 +104,121 @@ class CodexBridgeManager:
         codex_command: str = DEFAULT_CODEX_COMMAND,
         default_model: str = DEFAULT_CODEX_MODEL,
         runs_root: Path = RUNS_ROOT,
+        provider: str = DEFAULT_PROVIDER,
+        wsl_distro: str = DEFAULT_WSL_DISTRO,
     ) -> None:
         self.workspace_root = workspace_root.resolve()
         self.codex_command = codex_command
         self.default_model = default_model
         self.runs_root = runs_root.resolve()
+        self.provider = validate_choice(provider, ALLOWED_PROVIDERS, "provider")
+        self.wsl_distro = wsl_distro
         self.runs_root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._active_processes: dict[str, subprocess.Popen[str]] = {}
+
+    def _build_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        extras: list[str] = []
+        native_parent = Path(self.codex_command).expanduser().resolve().parent if any(sep in self.codex_command for sep in ("\\", "/")) else None
+        if native_parent is not None and native_parent.exists():
+            extras.append(str(native_parent))
+        if DEFAULT_NODE_DIR.exists():
+            extras.append(str(DEFAULT_NODE_DIR))
+        if DEFAULT_NATIVE_CODEX_PATH.parent.exists():
+            extras.append(str(DEFAULT_NATIVE_CODEX_PATH.parent))
+        existing = env.get("PATH", "")
+        env["PATH"] = ";".join([*extras, existing])
+        return env
+
+    def _resolve_native_command(self) -> str | None:
+        configured = self.codex_command.strip()
+        if any(sep in configured for sep in ("\\", "/")):
+            candidate = Path(configured).expanduser()
+            if candidate.exists():
+                return str(candidate)
+        resolved = shutil.which(configured, path=self._build_env().get("PATH"))
+        if resolved:
+            return resolved
+        if DEFAULT_NATIVE_CODEX_PATH.exists():
+            return str(DEFAULT_NATIVE_CODEX_PATH)
+        return None
+
+    def _windows_path_to_wsl(self, value: Path) -> str:
+        completed = subprocess.run(
+            ["wsl.exe", "-d", self.wsl_distro, "wslpath", "-a", str(value)],
+            cwd=str(self.workspace_root),
+            capture_output=True,
+            text=True,
+            timeout=20,
+            env=self._build_env(),
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError((completed.stderr or completed.stdout).strip() or "wslpath failed")
+        return completed.stdout.strip()
+
+    def _build_command(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        sandbox: str,
+        approval_mode: str,
+        repo_path: Path,
+        last_message_path: Path,
+        add_dirs: list[str],
+        skip_git_repo_check: bool,
+    ) -> tuple[list[str], str | None]:
+        common_args = [
+            "-a",
+            approval_mode,
+            "exec",
+            "--json",
+            "--output-last-message",
+            str(last_message_path),
+            "--model",
+            model,
+            "--sandbox",
+            sandbox,
+        ]
+        for extra_dir in add_dirs:
+            common_args.extend(["--add-dir", extra_dir])
+        if skip_git_repo_check:
+            common_args.append("--skip-git-repo-check")
+        common_args.append(prompt)
+
+        if self.provider == "native":
+            resolved_command = self._resolve_native_command()
+            if resolved_command is None:
+                raise FileNotFoundError(
+                    f"Could not resolve the Codex command '{self.codex_command}'. "
+                    "Set CONSTELLATION_CODEX_COMMAND if Codex lives somewhere else."
+                )
+            return [resolved_command, *common_args], resolved_command
+
+        repo_wsl = self._windows_path_to_wsl(repo_path)
+        last_message_wsl = self._windows_path_to_wsl(last_message_path)
+        wsl_args = [
+            "-a",
+            approval_mode,
+            "exec",
+            "--json",
+            "--output-last-message",
+            last_message_wsl,
+            "--model",
+            model,
+            "--sandbox",
+            sandbox,
+        ]
+        for extra_dir in add_dirs:
+            wsl_args.extend(["--add-dir", self._windows_path_to_wsl(Path(extra_dir).resolve())])
+        if skip_git_repo_check:
+            wsl_args.append("--skip-git-repo-check")
+        wsl_args.append(prompt)
+        command_name = self.codex_command.strip() or "codex"
+        shell_command = f"cd {shlex.quote(repo_wsl)} && {shlex.join([command_name, *wsl_args])}"
+        return ["wsl.exe", "-d", self.wsl_distro, "bash", "-lc", shell_command], f"wsl:{command_name}"
 
     def discover_repositories(self, max_repos: int = 20) -> list[dict[str, Any]]:
         repositories: list[dict[str, Any]] = []
@@ -145,31 +270,52 @@ class CodexBridgeManager:
         return resolved, skip_git_repo_check, resolved.name
 
     def status(self) -> dict[str, Any]:
-        resolved_command = shutil.which(self.codex_command)
+        resolved_command = self._resolve_native_command() if self.provider == "native" else self.codex_command
         payload: dict[str, Any] = {
             "workspace_root": str(self.workspace_root),
             "codex_command": self.codex_command,
             "command_path": resolved_command,
             "default_model": self.default_model,
+            "provider": self.provider,
+            "wsl_distro": self.wsl_distro if self.provider == "wsl" else None,
             "available": False,
             "active_task_ids": sorted(self._active_processes.keys()),
             "known_repositories": self.discover_repositories(max_repos=20),
         }
-        if resolved_command is None:
+        if self.provider == "native" and resolved_command is None:
             payload["error"] = (
                 f"Could not resolve the Codex command '{self.codex_command}'. "
                 "Set CONSTELLATION_CODEX_COMMAND if Codex lives somewhere else."
             )
             return payload
         try:
-            completed = subprocess.run(
-                [resolved_command, "--version"],
-                cwd=str(self.workspace_root),
-                capture_output=True,
-                text=True,
-                timeout=12,
-                check=False,
-            )
+            if self.provider == "native":
+                completed = subprocess.run(
+                    [str(resolved_command), "--version"],
+                    cwd=str(self.workspace_root),
+                    capture_output=True,
+                    text=True,
+                    timeout=12,
+                    env=self._build_env(),
+                    check=False,
+                )
+            else:
+                completed = subprocess.run(
+                    [
+                        "wsl.exe",
+                        "-d",
+                        self.wsl_distro,
+                        "bash",
+                        "-lc",
+                        f"{shlex.quote(self.codex_command or 'codex')} --version",
+                    ],
+                    cwd=str(self.workspace_root),
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                    env=self._build_env(),
+                    check=False,
+                )
         except (OSError, subprocess.SubprocessError) as exc:
             payload["error"] = (
                 f"Codex was found at '{resolved_command}' but could not be executed from this environment: {exc}"
@@ -215,11 +361,13 @@ class CodexBridgeManager:
         record.exit_code = exit_code
         record.finished_at = utc_now()
         record.last_message = tail_text(Path(record.last_message_path), max_chars=4000)
-        if exit_code == 0:
+        json_tail = tail_text(Path(record.json_output_path), max_chars=2500)
+        stderr_tail = tail_text(Path(record.stderr_path), max_chars=2500)
+        if exit_code == 0 or looks_like_completed_run(record.last_message, json_tail):
             record.status = "completed"
         else:
             record.status = "failed"
-            record.error = tail_text(Path(record.stderr_path), max_chars=4000) or "Codex exited with a non-zero code."
+            record.error = stderr_tail or "Codex exited with a non-zero code."
         self._save_record(record)
 
     def submit_task(
@@ -245,28 +393,17 @@ class CodexBridgeManager:
         json_output_path = task_dir / "events.jsonl"
         stderr_path = task_dir / "stderr.log"
         last_message_path = task_dir / "last_message.txt"
-        resolved_command = shutil.which(self.codex_command)
-        command = [
-            resolved_command or self.codex_command,
-            "exec",
-            "--json",
-            "--output-last-message",
-            str(last_message_path),
-            "--model",
-            (model or self.default_model).strip() or self.default_model,
-            "--sandbox",
-            sandbox,
-            "--ask-for-approval",
-            approval_mode,
-        ]
-
-        for extra_dir in add_dirs or []:
-            normalized = str(extra_dir).strip()
-            if normalized:
-                command.extend(["--add-dir", normalized])
-        if skip_git_repo_check:
-            command.append("--skip-git-repo-check")
-        command.append(cleaned_prompt)
+        normalized_add_dirs = [str(extra_dir).strip() for extra_dir in add_dirs or [] if str(extra_dir).strip()]
+        command, resolved_command = self._build_command(
+            prompt=cleaned_prompt,
+            model=(model or self.default_model).strip() or self.default_model,
+            sandbox=sandbox,
+            approval_mode=approval_mode,
+            repo_path=repo_path,
+            last_message_path=last_message_path,
+            add_dirs=normalized_add_dirs,
+            skip_git_repo_check=skip_git_repo_check,
+        )
 
         record = CodexTaskRecord(
             task_id=task_id,
@@ -299,6 +436,7 @@ class CodexBridgeManager:
                 stderr=stderr_handle,
                 text=True,
                 creationflags=creationflags,
+                env=self._build_env(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             stdout_handle.close()
@@ -345,11 +483,40 @@ class CodexBridgeManager:
                 if poll_result is not None:
                     record.exit_code = poll_result
                     record.finished_at = utc_now()
-                    record.status = "completed" if poll_result == 0 else "failed"
                     record.last_message = tail_text(Path(record.last_message_path), max_chars=4000)
-                    if poll_result != 0:
-                        record.error = tail_text(Path(record.stderr_path), max_chars=4000)
+                    json_tail = tail_text(Path(record.json_output_path), max_chars=2500)
+                    stderr_tail = tail_text(Path(record.stderr_path), max_chars=2500)
+                    if poll_result == 0 or looks_like_completed_run(record.last_message, json_tail):
+                        record.status = "completed"
+                        record.error = None
+                    else:
+                        record.status = "failed"
+                        record.error = stderr_tail
                     self._save_record(record)
+            else:
+                last_message = tail_text(Path(record.last_message_path), max_chars=4000)
+                json_tail = tail_text(Path(record.json_output_path), max_chars=2500)
+                stderr_tail = tail_text(Path(record.stderr_path), max_chars=2500)
+                if looks_like_completed_run(last_message, json_tail):
+                    record.status = "completed"
+                    record.finished_at = record.finished_at or utc_now()
+                    record.last_message = last_message
+                    record.error = None
+                    self._save_record(record)
+                elif stderr_tail:
+                    record.status = "failed"
+                    record.finished_at = record.finished_at or utc_now()
+                    record.error = stderr_tail
+                    self._save_record(record)
+        else:
+            last_message = tail_text(Path(record.last_message_path), max_chars=4000)
+            json_tail = tail_text(Path(record.json_output_path), max_chars=2500)
+            if looks_like_completed_run(last_message, json_tail):
+                record.status = "completed"
+                record.last_message = last_message
+                record.error = None
+                record.finished_at = record.finished_at or utc_now()
+                self._save_record(record)
         payload = record.to_payload()
         payload["json_output_tail"] = tail_text(Path(record.json_output_path), max_chars=2500)
         payload["stderr_tail"] = tail_text(Path(record.stderr_path), max_chars=2500)
@@ -362,7 +529,14 @@ class CodexBridgeManager:
         if process is None:
             payload = self.get_task_status(task_id)
             if payload["status"] in ACTIVE_STATUSES:
-                payload["error"] = "Task is marked active but no running process was found."
+                payload["status"] = "failed"
+                payload["finished_at"] = payload.get("finished_at") or utc_now()
+                payload["error"] = payload.get("stderr_tail") or "Task is marked active but no running process was found."
+                record = self._load_record(task_id)
+                record.status = "failed"
+                record.finished_at = payload["finished_at"]
+                record.error = payload["error"]
+                self._save_record(record)
             return payload
         process.terminate()
         try:
@@ -410,6 +584,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_CODEX_MODEL,
         help=f"Default Codex model (default: {DEFAULT_CODEX_MODEL}).",
     )
+    parser.add_argument(
+        "--provider",
+        default=DEFAULT_PROVIDER,
+        choices=ALLOWED_PROVIDERS,
+        help=f"How to launch Codex (default: {DEFAULT_PROVIDER}).",
+    )
+    parser.add_argument(
+        "--wsl-distro",
+        default=DEFAULT_WSL_DISTRO,
+        help=f"WSL distro to use when provider is wsl (default: {DEFAULT_WSL_DISTRO}).",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     repos_parser = subparsers.add_parser("repos", help="List discovered Git repos.")
@@ -445,6 +630,8 @@ def main() -> int:
         workspace_root=Path(args.workspace_root),
         codex_command=args.codex_command,
         default_model=args.default_model,
+        provider=args.provider,
+        wsl_distro=args.wsl_distro,
     )
 
     if args.command == "repos":

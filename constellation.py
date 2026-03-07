@@ -53,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("chat", help="Open the Constellation notes chat.")
     subparsers.add_parser("ingest", help="Import and transcribe new recordings.")
+    subparsers.add_parser("ideas", help="Mine notes for build ideas and Codex prompts.")
     subparsers.add_parser("realtime", help="Start the live speech-to-speech interface.")
     subparsers.add_parser("codex", help="Inspect or queue Codex CLI tasks through Constellation.")
 
@@ -73,6 +74,8 @@ def main() -> int:
         return run_script("voice_notes_chat.py", unknown)
     if args.command == "ingest":
         return run_script("voice_notes_ingest.py", unknown)
+    if args.command == "ideas":
+        return run_script("constellation_ideas.py", unknown)
     if args.command == "realtime":
         return run_script("voice_notes_realtime.py", unknown)
     if args.command == "codex":

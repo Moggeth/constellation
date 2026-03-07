@@ -25,11 +25,17 @@ from faq_notes_chat import (
     NotesIndex,
     compact_text,
 )
+from constellation_ideas import ConstellationIdeaMiner
 from constellation_codex import (
     ALLOWED_APPROVAL_MODES,
+    ALLOWED_PROVIDERS,
     ALLOWED_SANDBOXES,
+    DEFAULT_APPROVAL_MODE,
     DEFAULT_CODEX_COMMAND,
     DEFAULT_CODEX_MODEL,
+    DEFAULT_PROVIDER,
+    DEFAULT_SANDBOX,
+    DEFAULT_WSL_DISTRO,
     CodexBridgeManager,
 )
 from constellation_realtime_tray import run_realtime_tray
@@ -259,11 +265,13 @@ class RealtimeAssistantContext:
         archive_root: Path,
         ingest_script: Path,
         codex_bridge: CodexBridgeManager,
+        idea_miner: ConstellationIdeaMiner,
     ) -> None:
         self.workspace = WorkspaceTools(workspace_root)
         self.archive_root = archive_root.resolve()
         self.ingest_script = ingest_script.resolve()
         self.codex_bridge = codex_bridge
+        self.idea_miner = idea_miner
         self.notes_index = NotesIndex(self.archive_root) if NotesIndex is not None else None
 
     def tool_definitions(self) -> list[dict[str, Any]]:
@@ -427,6 +435,57 @@ class RealtimeAssistantContext:
                     "additionalProperties": False,
                 },
             },
+            {
+                "type": "function",
+                "name": "mine_notes_for_ideas",
+                "description": "Extract likely build ideas from recent or matching notes using GPT-5.4.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "month": {"type": "string"},
+                        "max_notes": {"type": "integer", "minimum": 1, "maximum": 20},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 8},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": "build_codex_prompt_from_idea",
+                "description": "Turn a chosen idea into a concrete Codex task prompt.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "source_note_ids": {"type": "array", "items": {"type": "string"}},
+                        "repo_name_or_path": {"type": "string"},
+                        "extra_instruction": {"type": "string"},
+                    },
+                    "required": ["title", "summary", "source_note_ids"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": "start_codex_task_from_idea",
+                "description": "Build a Codex prompt from a chosen note-derived idea and queue it immediately.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "source_note_ids": {"type": "array", "items": {"type": "string"}},
+                        "repo_name_or_path": {"type": "string"},
+                        "extra_instruction": {"type": "string"},
+                        "sandbox": {"type": "string", "enum": list(ALLOWED_SANDBOXES)},
+                        "approval_mode": {"type": "string", "enum": list(ALLOWED_APPROVAL_MODES)},
+                    },
+                    "required": ["title", "summary", "source_note_ids"],
+                    "additionalProperties": False,
+                },
+            },
         ]
 
         if self.notes_index is not None:
@@ -567,6 +626,46 @@ class RealtimeAssistantContext:
                 return self.codex_bridge.cancel_task(str(args.get("task_id", "")))
             except FileNotFoundError as exc:
                 return {"ok": False, "error": str(exc)}
+        if name == "mine_notes_for_ideas":
+            try:
+                return self.idea_miner.mine_ideas(
+                    query=normalize_optional_string(args.get("query")),
+                    month=normalize_optional_string(args.get("month")),
+                    max_notes=int(args.get("max_notes", 8)),
+                    limit=int(args.get("limit", 5)),
+                )
+            except (OSError, ValueError, RuntimeError) as exc:
+                return {"ok": False, "error": str(exc)}
+        if name == "build_codex_prompt_from_idea":
+            try:
+                return self.idea_miner.build_codex_prompt(
+                    title=str(args.get("title", "")),
+                    summary=str(args.get("summary", "")),
+                    source_note_ids=[str(item) for item in args.get("source_note_ids", [])],
+                    repo_name_or_path=normalize_optional_string(args.get("repo_name_or_path")),
+                    extra_instruction=normalize_optional_string(args.get("extra_instruction")),
+                )
+            except (OSError, ValueError, RuntimeError) as exc:
+                return {"ok": False, "error": str(exc)}
+        if name == "start_codex_task_from_idea":
+            try:
+                prompt_payload = self.idea_miner.build_codex_prompt(
+                    title=str(args.get("title", "")),
+                    summary=str(args.get("summary", "")),
+                    source_note_ids=[str(item) for item in args.get("source_note_ids", [])],
+                    repo_name_or_path=normalize_optional_string(args.get("repo_name_or_path")),
+                    extra_instruction=normalize_optional_string(args.get("extra_instruction")),
+                )
+                task = self.codex_bridge.submit_task(
+                    prompt=prompt_payload["prompt"],
+                    repo_name_or_path=normalize_optional_string(args.get("repo_name_or_path")),
+                    title=str(args.get("title", "")),
+                    sandbox=str(args.get("sandbox", DEFAULT_SANDBOX)),
+                    approval_mode=str(args.get("approval_mode", DEFAULT_APPROVAL_MODE)),
+                )
+            except (OSError, ValueError, FileNotFoundError, NotADirectoryError, RuntimeError) as exc:
+                return {"ok": False, "error": str(exc)}
+            return {"ok": True, "prompt": prompt_payload, "task": task}
 
         if self.notes_index is None:
             return {"ok": False, "error": f"Notes tools unavailable: {NOTES_IMPORT_ERROR or 'unknown import error'}"}
@@ -1036,6 +1135,12 @@ async def run_voice_chat(args: argparse.Namespace) -> None:
             workspace_root=Path(args.workspace_root).resolve(),
             codex_command=args.codex_command,
             default_model=args.codex_model,
+            provider=args.codex_provider,
+            wsl_distro=args.codex_wsl_distro,
+        ),
+        idea_miner=ConstellationIdeaMiner(
+            archive_root=Path(args.archive_root).resolve(),
+            model=args.idea_model,
         ),
     )
     runtime_preferences = RuntimePreferences(
@@ -1092,9 +1197,25 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Codex executable or alias for bridge tasks (default: {DEFAULT_CODEX_COMMAND}).",
     )
     parser.add_argument(
+        "--codex-provider",
+        default=DEFAULT_PROVIDER,
+        choices=ALLOWED_PROVIDERS,
+        help=f"How to launch Codex bridge tasks (default: {DEFAULT_PROVIDER}).",
+    )
+    parser.add_argument(
+        "--codex-wsl-distro",
+        default=DEFAULT_WSL_DISTRO,
+        help=f"WSL distro to use when Codex provider is wsl (default: {DEFAULT_WSL_DISTRO}).",
+    )
+    parser.add_argument(
         "--codex-model",
         default=DEFAULT_CODEX_MODEL,
         help=f"Default Codex model for bridge tasks (default: {DEFAULT_CODEX_MODEL}).",
+    )
+    parser.add_argument(
+        "--idea-model",
+        default=DEFAULT_CODEX_MODEL,
+        help=f"Model for mining note ideas and drafting Codex prompts (default: {DEFAULT_CODEX_MODEL}).",
     )
     return parser
 

@@ -34,6 +34,15 @@
       "description": "Shared metadata and runtime controls for voice speed, concise mode, thinking sound, and supported voices."
     },
     {
+      "name": "idea_mining",
+      "kind": "toolbelt",
+      "status": "active",
+      "entrypoints": [
+        "constellation_ideas.py"
+      ],
+      "description": "GPT-5.4-powered note mining and Codex prompt drafting for turning captured ideas into implementation tasks."
+    },
+    {
       "name": "codex_cli_bridge",
       "kind": "toolbelt",
       "status": "active",
