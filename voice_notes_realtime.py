@@ -91,11 +91,48 @@ SESSION_INSTRUCTIONS = (
     "If the user asks you to talk faster, slower, shorter, more detailed, or switch voices, call the runtime preference tools. "
     "If the user asks what voices are available, call the voice catalog tool. "
     "If the user explicitly asks you to build, edit, review, or wire up code, use the Codex bridge tools instead of pretending the work is already done. "
-    "For small direct workspace changes like creating a simple file, you can use the local file write tools directly. "
+    "For small direct workspace changes like creating or editing a simple file, use the local workspace tools directly before escalating to Codex. "
+    "If the user asks to open a file or folder from the workspace, use the local open-path tool. "
+    "If the user asks you to run or verify a small script and a direct local path is not available, use the Codex bridge rather than claiming you cannot do it. "
     "Before launching a Codex task that could change files or install software, briefly restate the target repo and intended action. "
     "Use the safest sandbox that still fits the job, and only use danger-full-access if the user clearly wants machine-level changes. "
     "Do not mention internal implementation details unless asked."
 )
+
+
+def configure_console_output() -> None:
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            with contextlib.suppress(OSError, ValueError):
+                reconfigure(encoding="utf-8", errors="replace")
+
+
+def console_print(*parts: Any, sep: str = " ", end: str = "\n", flush: bool = False) -> None:
+    text = sep.join(str(part) for part in parts) + end
+    stream = sys.stdout
+    try:
+        stream.write(text)
+        if flush:
+            stream.flush()
+        return
+    except UnicodeEncodeError:
+        pass
+
+    buffer = getattr(stream, "buffer", None)
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    encoded = text.encode(encoding, errors="replace")
+    if buffer is not None:
+        buffer.write(encoded)
+        if flush:
+            buffer.flush()
+        return
+    stream.write(encoded.decode(encoding, errors="replace"))
+    if flush:
+        stream.flush()
 
 
 class ThinkingIndicator:
@@ -132,7 +169,7 @@ class ThinkingIndicator:
             with contextlib.suppress(RuntimeError):
                 winsound.Beep(880, 60)
             return
-        print("\a", end="", flush=True)
+        console_print("\a", end="", flush=True)
 
 
 def normalize_optional_string(value: str | None) -> str | None:
@@ -270,6 +307,25 @@ class WorkspaceTools:
             "replacements_available": replacements,
             "replacements_applied": min(replacements, count),
             "restart_recommended": target.suffix == ".py",
+        }
+
+    def open_path(self, relative_path: str) -> dict[str, Any]:
+        target = ensure_within_root(self.root, self.root / relative_path)
+        if not target.exists():
+            return {"ok": False, "error": f"Path not found: {relative_path}"}
+        try:
+            if os.name == "nt":
+                os.startfile(str(target))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(target)])
+            else:
+                subprocess.Popen(["xdg-open", str(target)])
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {
+            "ok": True,
+            "relative_path": str(target.relative_to(self.root)),
+            "opened_in_default_app": True,
         }
 
     def search(self, query: str, max_results: int = 8, subpath: str | None = None) -> dict[str, Any]:
@@ -489,6 +545,19 @@ class RealtimeAssistantContext:
                         "count": {"type": "integer", "minimum": 1, "maximum": 100},
                     },
                     "required": ["relative_path", "old_text", "new_text"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": "open_path_in_default_app",
+                "description": "Open a workspace file or folder in the operating system's default app.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "relative_path": {"type": "string"},
+                    },
+                    "required": ["relative_path"],
                     "additionalProperties": False,
                 },
             },
@@ -756,6 +825,8 @@ class RealtimeAssistantContext:
                 new_text=str(args.get("new_text", "")),
                 count=int(args.get("count", 1)),
             )
+        if name == "open_path_in_default_app":
+            return self.workspace.open_path(relative_path=str(args.get("relative_path", "")))
         if name == "get_codex_bridge_status":
             return self.codex_bridge.status()
         if name == "list_codex_repositories":
@@ -990,7 +1061,7 @@ class MicCapture:
 
     def _callback(self, indata: Any, frames: int, time_info: Any, status: sd.CallbackFlags) -> None:
         if status:
-            print(f"[audio warning] input status: {status}")
+            console_print(f"[audio warning] input status: {status}")
         chunk = bytes(indata)
         self.loop.call_soon_threadsafe(self._push_chunk, chunk)
 
@@ -1103,8 +1174,8 @@ async def run_single_voice_session(
     pending_restart_announcement: str | None = None
     restart_after_response = False
 
-    print(f"Connecting to realtime model: {args.model}")
-    print("Press Ctrl+C to quit.")
+    console_print(f"Connecting to realtime model: {args.model}")
+    console_print("Press Ctrl+C to quit.")
     session_logger.log_event(
         "session_start",
         {
@@ -1144,16 +1215,16 @@ async def run_single_voice_session(
 
                 if event_type == "session.created":
                     session_logger.log_event("session_created", {"event_type": event_type})
-                    print("[session] created")
+                    console_print("[session] created")
                     continue
                 if event_type == "session.updated":
                     session_logger.log_event("session_updated", {"voice": runtime_preferences.voice})
-                    print("[session] updated and ready")
+                    console_print("[session] updated and ready")
                     continue
                 if event_type == "input_audio_buffer.speech_started":
                     player.clear()
                     thinking_indicator.stop()
-                    print("[you] listening...")
+                    console_print("[you] listening...")
                     continue
                 if event_type == "input_audio_buffer.speech_stopped":
                     thinking_indicator.start()
@@ -1164,7 +1235,7 @@ async def run_single_voice_session(
                         seen_user_transcripts.add(event.item_id)
                         conversation_history.append({"role": "user", "text": transcript})
                         session_logger.log_transcript("user", transcript)
-                        print(f"[you] {transcript}")
+                        console_print(f"[you] {transcript}")
                     continue
                 if event_type == "response.created":
                     thinking_indicator.start()
@@ -1189,7 +1260,7 @@ async def run_single_voice_session(
                     if transcript:
                         conversation_history.append({"role": "assistant", "text": transcript})
                         session_logger.log_transcript("assistant", transcript)
-                        print(f"[assistant] {transcript}")
+                        console_print(f"[assistant] {transcript}")
                         assistant_output_received.set()
                     assistant_partial.pop(event.item_id, None)
                     continue
@@ -1200,7 +1271,7 @@ async def run_single_voice_session(
                         if text:
                             conversation_history.append({"role": "assistant", "text": text})
                             session_logger.log_transcript("assistant", text)
-                            print(f"[assistant] {text}")
+                            console_print(f"[assistant] {text}")
                             assistant_output_received.set()
                     continue
                 if event_type == "response.function_call_arguments.done":
@@ -1210,7 +1281,7 @@ async def run_single_voice_session(
                     except json.JSONDecodeError as exc:
                         tool_result = {"ok": False, "error": f"Invalid tool arguments: {exc}"}
                     else:
-                        print(f"[tool] {tool_name}({json.dumps(tool_args)})")
+                        console_print(f"[tool] {tool_name}({json.dumps(tool_args, ensure_ascii=False)})")
                         session_logger.log_event(
                             "tool_call_started",
                             {"tool_name": tool_name, "arguments": tool_args},
@@ -1340,7 +1411,7 @@ async def run_single_voice_session(
                         "session_error",
                         {"message": getattr(event.error, "message", "Unknown realtime error")},
                     )
-                    print(f"[error] {event.error.message}")
+                    console_print(f"[error] {event.error.message}")
                     if args.greeting_only or args.prompt:
                         break
         finally:
@@ -1477,7 +1548,7 @@ def parse_device(value: str | None) -> str | int | None:
 def print_audio_devices() -> None:
     devices = sd.query_devices()
     for index, device in enumerate(devices):
-        print(
+        console_print(
             f"{index}: {device['name']} "
             f"(in={device['max_input_channels']}, out={device['max_output_channels']}, "
             f"default_sr={device['default_samplerate']})"
@@ -1486,17 +1557,17 @@ def print_audio_devices() -> None:
 
 def print_available_voices(current_voice: str) -> None:
     catalog = build_voice_catalog(current_voice)
-    print("Realtime voices:")
+    console_print("Realtime voices:")
     for voice in catalog["available_realtime_voices"]:
         marker = " (current)" if voice == current_voice else ""
-        print(f"- {voice}{marker}")
-    print(catalog["note"])
+        console_print(f"- {voice}{marker}")
+    console_print(catalog["note"])
 
 
 async def async_main(args: argparse.Namespace) -> int:
     if args.list_models:
         for model in list_realtime_models_sync():
-            print(model)
+            console_print(model)
         return 0
     if args.list_voices:
         print_available_voices(args.voice)
@@ -1516,12 +1587,13 @@ async def async_main(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    configure_console_output()
     parser = build_parser()
     args = parser.parse_args()
     try:
         return asyncio.run(async_main(args))
     except KeyboardInterrupt:
-        print("\nStopped.")
+        console_print("\nStopped.")
         return 130
 
 

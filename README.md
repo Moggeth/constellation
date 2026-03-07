@@ -153,6 +153,7 @@ Realtime session logs now go to `toolbelt/realtime_sessions/<timestamp>/` by def
 - native user/assistant transcript lines
 - tool calls and tool results
 - session start/stop/error events
+- enough context to reconstruct voice-switch continuity and tool failures
 
 Disable that logging if needed:
 
@@ -165,6 +166,7 @@ Notes on realtime voices:
 - Supported realtime voices are currently `alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`, `shimmer`, `verse`, `marin`, and `cedar`.
 - If you ask the assistant to switch voices mid-session, it now reconnects briefly and continues in the new voice.
 - Voice changes now carry forward recent conversation context instead of starting from a blank slate.
+- The live runtime now uses UTF-8-safe console output on Windows so transcribed characters do not crash the session.
 - Tray mode remembers the default voice, can relaunch the live session without a terminal window, and uses a Constellation-themed starry tray icon.
 
 Check Codex bridge status:
