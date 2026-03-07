@@ -1,10 +1,15 @@
 # FAQ Notes Tool
 
-USB recorder ingestion and Whisper transcription tool for FAQ voice notes.
+Notes archive repo with two entrypoints:
+
+- `faq_notes_ingest.py` for importing and transcribing recordings
+- `faq_notes_chat.py` for chatting with the archive and turning notes into actionable outputs
+
+The name is legacy. In practice this repo is broader than FAQ capture and is intended to be the local notes/archive layer for future tooling.
 
 ## What it does
 
-- Detects connected devices (Windows + Ubuntu/Linux mount points).
+- Detects connected devices on Windows, Ubuntu/Linux mount points, and macOS `/Volumes`.
 - Scans media files from the selected device/path.
 - Uses a fast metadata index to skip re-hashing known files, then hashes only unknown candidates.
 - Copies new files to monthly folders under this tool folder: `faq_notes/YYYY-MM/audio/`.
@@ -20,7 +25,7 @@ USB recorder ingestion and Whisper transcription tool for FAQ voice notes.
 - `OPENAI_API_KEY` environment variable
 - Python package: `openai`
 - Optional for PostgreSQL backend: `psycopg[binary]`
-- Optional for tray mode on Windows: `pystray`, `Pillow`
+- Optional for tray mode on Windows, macOS, and Linux: `pystray`, `Pillow`
 
 Install package:
 
@@ -48,6 +53,31 @@ Run from this folder:
 python faq_notes_ingest.py
 ```
 
+Open the chat interface:
+
+```bash
+python faq_notes_chat.py
+```
+
+Import first, then open chat:
+
+```bash
+python faq_notes_chat.py --import-first
+```
+
+Ask one question without entering the REPL:
+
+```bash
+python faq_notes_chat.py --prompt "Find my latest coding ideas and turn them into a build brief."
+```
+
+Inspect the archive without calling GPT:
+
+```bash
+python faq_notes_chat.py --stats
+python faq_notes_chat.py --list-recent 5
+```
+
 Run from project root:
 
 ```bash
@@ -72,10 +102,28 @@ Watch for newly connected devices:
 python faq_notes_ingest.py --watch
 ```
 
-Run in Windows system tray (first time each device is seen, approval is required):
+Run in the system tray (first time each device is seen, approval is required):
 
 ```bash
 python faq_notes_ingest.py --tray
+```
+
+Run quietly in the background and write logs to `faq_notes/faq_notes.log`:
+
+```bash
+python faq_notes_ingest.py --tray --quiet
+```
+
+Install tray mode to launch automatically when you sign in:
+
+```bash
+python faq_notes_ingest.py --install-startup
+```
+
+Remove the startup launcher:
+
+```bash
+python faq_notes_ingest.py --remove-startup
 ```
 
 Set parallel workers (default is parallel already):
@@ -124,7 +172,26 @@ Notes on archive root:
 
 - In watch/tray mode, newly detected device IDs require manual approval once.
 - After approval, that exact device ID is auto-processed on future reconnects.
+- If the tray app starts while an already-approved device is still attached, it is processed immediately on startup.
 - If a new device is not approved, it is ignored until approved on a later connection.
+- Tray mode now uses GUI approval prompts on Windows, macOS, and Linux when available, so first-time approval still works after launch-at-login.
+
+## Tray mode polish
+
+- Tray mode now animates the tray icon while an import is actively running.
+- Tray icon states are visually distinct for monitoring, paused, restart-pending, restarting, and active import states.
+- Tray mode uses desktop banner notifications (`icon.notify`) for import start and import completion when supported by the OS tray backend.
+- Tray mode watches the local project code and automatically restarts itself when `.py` files or startup-relevant config files change.
+- If code changes while an import or scan is in progress, restart is deferred until the current work finishes.
+- The top-level tray menu stays minimal: status, pause/resume, scan now, restart service, advanced options, and quit.
+- `Advanced` contains the import start/end notification toggles, last event/last scan status, and shortcuts to the archive folder and log file.
+- Tray notification preferences are stored per machine in `faq_notes/tray_settings.json`.
+- `--install-startup` now installs a per-user launcher on each supported OS:
+  - Windows: Startup folder `.vbs`
+  - Ubuntu/Linux: `~/.config/autostart/*.desktop`
+  - macOS: `~/Library/LaunchAgents/*.plist`
+- Tray mode logs to `faq_notes/faq_notes.log` by default, or to a custom path with `--log-file`.
+- On Ubuntu/Linux, `zenity` is recommended so first-time approval prompts appear cleanly from background tray mode.
 
 ## Duplicate detection modes
 
@@ -152,6 +219,7 @@ Notes on archive root:
 ```text
 faq_notes_tool/
   faq_notes_ingest.py
+  faq_notes_chat.py
   README.md
   faq_notes/
     manifest.json
@@ -164,3 +232,16 @@ faq_notes_tool/
       FAQ_YYYY-MM_device_1.txt
       FAQ_YYYY-MM_device_2.txt
 ```
+
+## Chat commands
+
+- `/help`
+- `/stats`
+- `/months`
+- `/latest`
+- `/find <query>`
+- `/read <note_id>`
+- `/import [path]`
+- `/refresh`
+- `/reset`
+- `/exit`
