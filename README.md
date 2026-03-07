@@ -2,10 +2,11 @@
 
 Constellation is the umbrella name for this growing local system of notes, voice interfaces, tools, and linked data sources.
 
-Current repo/folder name is still `faq_notes_tool`, and some file names remain legacy for compatibility, but this is now the canonical Constellation repo.
+Some file names remain legacy for compatibility, but this is now the canonical Constellation repo.
 
 Current entrypoints in this repo:
 
+- `constellation.py` as the top-level launcher
 - `faq_notes_ingest.py` for importing and transcribing recordings
 - `faq_notes_chat.py` for chatting with the archive and turning notes into actionable outputs
 - `voice_notes_realtime.py` for optional live speech-to-speech use
@@ -15,6 +16,16 @@ Preferred entrypoints now use `voice_notes_*` aliases:
 - `voice_notes_ingest.py`
 - `voice_notes_chat.py`
 - `voice_notes_realtime.py`
+- `constellation.py`
+
+Top-level launcher:
+
+```bash
+python constellation.py chat
+python constellation.py ingest --yes
+python constellation.py realtime --list-voices
+python constellation.py toolbelt list
+```
 
 ## What it does
 
@@ -129,7 +140,7 @@ Notes on realtime voices:
 Run from project root:
 
 ```bash
-python faq_notes_tool/faq_notes_ingest.py
+python constellation/faq_notes_ingest.py
 ```
 
 Use explicit source path:
@@ -265,15 +276,20 @@ Notes on archive root:
 ## Output structure
 
 ```text
-faq_notes_tool/
+constellation/
+  constellation.py
   faq_notes_ingest.py
   faq_notes_chat.py
   voice_notes_ingest.py
   voice_notes_chat.py
   voice_notes_realtime.py
   voice_notes_toolbelt.py
+  ROADMAP.md
   README.md
   toolbelt/
+    registry.json
+    plugins/
+    skills/
   faq_notes/
     manifest.json
     YYYY-MM/

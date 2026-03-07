@@ -1,0 +1,43 @@
+{
+  "name": "Constellation Toolbelt",
+  "version": 1,
+  "tools": [
+    {
+      "name": "notes_archive",
+      "kind": "core",
+      "status": "active",
+      "entrypoints": [
+        "faq_notes_ingest.py",
+        "faq_notes_chat.py",
+        "voice_notes_ingest.py",
+        "voice_notes_chat.py"
+      ],
+      "description": "Imports, indexes, searches, and chats with the local voice note archive."
+    },
+    {
+      "name": "realtime_voice",
+      "kind": "interface",
+      "status": "active",
+      "entrypoints": [
+        "voice_notes_realtime.py"
+      ],
+      "description": "Live speech-to-speech interface with workspace tools, notes tools, and runtime voice controls."
+    },
+    {
+      "name": "runtime_voice_controls",
+      "kind": "toolbelt",
+      "status": "active",
+      "entrypoints": [
+        "voice_notes_toolbelt.py"
+      ],
+      "description": "Shared metadata and runtime controls for voice speed, concise mode, thinking sound, and supported voices."
+    },
+    {
+      "name": "codex_cli_bridge",
+      "kind": "planned",
+      "status": "planned",
+      "entrypoints": [],
+      "description": "Planned bridge for voice-driven coding tasks through Codex CLI and GPT-5.4 workflows."
+    }
+  ]
+}
