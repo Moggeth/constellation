@@ -12,3 +12,4 @@ Examples:
 Near-term goal:
 
 - keep the skill contract explicit so voice-driven orchestration can choose the right workflow without hardcoding every path in one giant script
+- keep enough local structure and logging that a fresh Codex thread can resume work safely

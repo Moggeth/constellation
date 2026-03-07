@@ -17,6 +17,7 @@ Preferred entrypoints now use `voice_notes_*` aliases:
 - `voice_notes_chat.py`
 - `voice_notes_realtime.py`
 - `constellation.py`
+- `AGENTS.md` for future Codex-thread continuity inside this repo
 
 Top-level launcher:
 
@@ -29,6 +30,8 @@ python constellation.py realtime --tray
 python constellation.py codex status
 python constellation.py toolbelt list
 ```
+
+Fresh-thread guidance for future Codex work in this repo lives in [AGENTS.md](C:\Users\mog\OneDrive\Documents\Coding\Personal\Python\things_are_different_now\constellation\AGENTS.md).
 
 ## What it does
 
@@ -154,6 +157,7 @@ Realtime session logs now go to `toolbelt/realtime_sessions/<timestamp>/` by def
 - tool calls and tool results
 - session start/stop/error events
 - enough context to reconstruct voice-switch continuity and tool failures
+- enough information for a fresh Codex thread to diagnose recent runtime behavior
 
 Disable that logging if needed:
 
@@ -173,6 +177,12 @@ Check Codex bridge status:
 
 ```bash
 python constellation.py codex status
+```
+
+Inspect recent live-session logs when debugging the runtime:
+
+```bash
+toolbelt/realtime_sessions/<timestamp>/
 ```
 
 List candidate repos for Codex work:
