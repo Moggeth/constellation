@@ -1,6 +1,6 @@
-# Voice Notes Toolbelt
+# Constellation Toolbelt
 
-This folder marks the future boundary for reusable local tools that the notes and voice interfaces can call.
+This folder marks the future boundary for reusable local tools that Constellation interfaces can call.
 
 Current direction:
 

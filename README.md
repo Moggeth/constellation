@@ -1,12 +1,14 @@
-# FAQ Notes Tool
+# Constellation
 
-Notes archive repo with two entrypoints:
+Constellation is the umbrella name for this growing local system of notes, voice interfaces, tools, and linked data sources.
+
+Current repo/folder name is still `faq_notes_tool`, and some file names remain legacy for compatibility, but this is now the canonical Constellation repo.
+
+Current entrypoints in this repo:
 
 - `faq_notes_ingest.py` for importing and transcribing recordings
 - `faq_notes_chat.py` for chatting with the archive and turning notes into actionable outputs
 - `voice_notes_realtime.py` for optional live speech-to-speech use
-
-The name is legacy. In practice this repo is broader than FAQ capture and is intended to be the local notes/archive layer for future tooling.
 
 Preferred entrypoints now use `voice_notes_*` aliases:
 
@@ -16,6 +18,7 @@ Preferred entrypoints now use `voice_notes_*` aliases:
 
 ## What it does
 
+- Acts as the current core of Constellation.
 - Detects connected devices on Windows, Ubuntu/Linux mount points, and macOS `/Volumes`.
 - Scans media files from the selected device/path.
 - Uses a fast metadata index to skip re-hashing known files, then hashes only unknown candidates.
@@ -103,6 +106,8 @@ Start realtime voice chat:
 ```bash
 python voice_notes_realtime.py
 ```
+
+This is the most direct current entrypoint for the live Constellation experience.
 
 List supported realtime voices:
 
@@ -296,7 +301,7 @@ faq_notes_tool/
 
 ## Toolbelt Direction
 
-The repo now includes a small `toolbelt/` seed plus `voice_notes_toolbelt.py` as the start of a reusable local-tool layer. The current split is:
+The repo now includes a small `toolbelt/` seed plus `voice_notes_toolbelt.py` as the start of the Constellation toolbelt layer. The current split is:
 
 - notes/archive behavior stays here
 - reusable runtime controls and voice metadata begin moving into the toolbelt
