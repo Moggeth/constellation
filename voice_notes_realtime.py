@@ -2,13 +2,21 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import asyncio
 import base64
 import contextlib
+import io
 import json
+import math
 import os
+import struct
 import subprocess
 import sys
+import tempfile
+import time
+import wave
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -39,10 +47,13 @@ from constellation_codex import (
     DEFAULT_WSL_DISTRO,
     CodexBridgeManager,
 )
+from constellation_runtime import ensure_runtime_layout, load_runtime_paths
 from constellation_realtime_tray import run_realtime_tray
 from voice_notes_toolbelt import (
     AVAILABLE_REALTIME_VOICES,
     DEFAULT_SPEECH_SPEED,
+    MAX_SPEECH_SPEED,
+    MIN_SPEECH_SPEED,
     VOICE_CHANGE_REQUIRES_RECONNECT,
     RuntimePreferences,
     build_voice_catalog,
@@ -55,7 +66,8 @@ SAMPLE_RATE = 24_000
 CHANNELS = 1
 FRAME_MS = 20
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
-WORKSPACE_ROOT = SCRIPT_DIR.parent.resolve()
+RUNTIME_PATHS = ensure_runtime_layout(load_runtime_paths())
+WORKSPACE_ROOT = RUNTIME_PATHS.workspace_path
 DEFAULT_SESSION_LOG_ROOT = SCRIPT_DIR / "toolbelt" / "realtime_sessions"
 NOTES_IMPORT_ERROR: str | None = None
 
@@ -79,6 +91,57 @@ TEXT_FILE_EXTENSIONS = {
     ".yml",
 }
 
+
+class SingleInstanceGuard:
+    def __init__(self, name: str) -> None:
+        self.path = Path(tempfile.gettempdir()) / f"{name}.lock"
+        self.handle: Any | None = None
+
+    def try_acquire(self) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("a+b")
+        handle.seek(0)
+        handle.write(b" ")
+        handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            return False
+
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"{os.getpid()}\n".encode("utf-8"))
+        handle.flush()
+        self.handle = handle
+        atexit.register(self.release)
+        return True
+
+    def release(self) -> None:
+        if self.handle is None:
+            return
+        with contextlib.suppress(OSError):
+            self.handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            self.handle.close()
+        self.handle = None
+
 SESSION_INSTRUCTIONS = (
     "You are the user's live voice assistant running on their computer. "
     "Be practical, helpful, and very concise. "
@@ -92,10 +155,16 @@ SESSION_INSTRUCTIONS = (
     "If the user asks what voices are available, call the voice catalog tool. "
     "If the user explicitly asks you to build, edit, review, or wire up code, use the Codex bridge tools instead of pretending the work is already done. "
     "For small direct workspace changes like creating or editing a simple file, use the local workspace tools directly before escalating to Codex. "
+    "Treat the dedicated workspace as writable scratch space for new files and experiments. "
+    "Treat any mounted library roots as read-only unless the user explicitly asks to modify one of those older repos, in which case use Codex against the chosen repo. "
+    "Never blank, delete, or overwrite an existing file with empty content unless the user explicitly asks for that destructive action. "
+    "If no mounted libraries are configured, say so briefly and keep working inside the Constellation repo workspace. "
     "If the user asks to open a file or folder from the workspace, use the local open-path tool. "
     "If the user asks you to run or verify a small script and a direct local path is not available, use the Codex bridge rather than claiming you cannot do it. "
     "Before launching a Codex task that could change files or install software, briefly restate the target repo and intended action. "
     "Use the safest sandbox that still fits the job, and only use danger-full-access if the user clearly wants machine-level changes. "
+    "If the user asks you to review the logs, introspect on the last session, or self-reflect on recent behavior, inspect the latest realtime session logs and transcript, look for errors, failed or abandoned tool calls, slow actions, timing gaps, and what the user last asked for. "
+    "When that review reveals a concrete runtime bug and the user wants it fixed, implement the change rather than only describing it. "
     "Do not mention internal implementation details unless asked."
 )
 
@@ -136,33 +205,53 @@ def console_print(*parts: Any, sep: str = " ", end: str = "\n", flush: bool = Fa
 
 
 class ThinkingIndicator:
+    BACKGROUND_START_DELAY_SECONDS = 0.65
+    BACKGROUND_REPEAT_SECONDS = 1.6
+    HANDOFF_COOLDOWN_SECONDS = 0.25
+
     def __init__(self, *, enabled: bool) -> None:
         self.enabled = enabled
-        self._active = False
-        self._task: asyncio.Task[None] | None = None
+        self._background_active = False
+        self._background_task: asyncio.Task[None] | None = None
+        self._last_handoff_at = 0.0
 
-    def start(self) -> None:
-        if not self.enabled or self._active:
+    def play_handoff(self) -> None:
+        if not self.enabled:
             return
-        self._active = True
-        self._task = asyncio.create_task(self._loop())
+        now = time.monotonic()
+        if now - self._last_handoff_at < self.HANDOFF_COOLDOWN_SECONDS:
+            return
+        self._last_handoff_at = now
+        asyncio.create_task(asyncio.to_thread(self._play_handoff_once))
+
+    def start_background(self) -> None:
+        if not self.enabled or self._background_active:
+            return
+        self._background_active = True
+        self._background_task = asyncio.create_task(self._background_loop())
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.enabled = enabled
+        if not enabled:
+            self.stop()
 
     def stop(self) -> None:
-        self._active = False
-        if self._task is not None:
-            self._task.cancel()
-            self._task = None
+        self._background_active = False
+        if self._background_task is not None:
+            self._background_task.cancel()
+            self._background_task = None
 
-    async def _loop(self) -> None:
-        while self._active:
-            await asyncio.to_thread(self._beep_once)
-            try:
-                await asyncio.sleep(0.8)
-            except asyncio.CancelledError:
-                return
+    async def _background_loop(self) -> None:
+        try:
+            await asyncio.sleep(self.BACKGROUND_START_DELAY_SECONDS)
+            while self._background_active:
+                await asyncio.to_thread(self._play_background_once)
+                await asyncio.sleep(self.BACKGROUND_REPEAT_SECONDS)
+        except asyncio.CancelledError:
+            return
 
-    @staticmethod
-    def _beep_once() -> None:
+    @classmethod
+    def _play_handoff_once(cls) -> None:
         if os.name == "nt":
             import winsound
 
@@ -170,6 +259,42 @@ class ThinkingIndicator:
                 winsound.Beep(880, 60)
             return
         console_print("\a", end="", flush=True)
+
+    @classmethod
+    def _play_background_once(cls) -> None:
+        if os.name == "nt":
+            cls._play_windows_wave(
+                [
+                    (720.0, 0.028, 0.14),
+                    (510.0, 0.04, 0.1),
+                ]
+            )
+            return
+        console_print("\a", end="", flush=True)
+
+    @classmethod
+    def _play_windows_wave(cls, segments: list[tuple[float, float, float]]) -> None:
+        import winsound
+
+        sample_rate = 24_000
+        frames = bytearray()
+        for frequency, duration, amplitude in segments:
+            sample_count = max(1, int(sample_rate * duration))
+            for index in range(sample_count):
+                progress = index / sample_count
+                envelope = math.sin(math.pi * progress)
+                sample = math.sin(2 * math.pi * frequency * progress * duration)
+                value = int(32767 * amplitude * envelope * sample)
+                frames.extend(struct.pack("<h", value))
+
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(bytes(frames))
+        with contextlib.suppress(RuntimeError):
+            winsound.PlaySound(buffer.getvalue(), winsound.SND_MEMORY)
 
 
 def normalize_optional_string(value: str | None) -> str | None:
@@ -273,6 +398,14 @@ class WorkspaceTools:
             return {"ok": False, "error": f"Path is a directory: {relative_path}"}
         if target.exists() and not overwrite:
             return {"ok": False, "error": f"File already exists: {relative_path}"}
+        if target.exists() and not content:
+            return {
+                "ok": False,
+                "error": (
+                    "Refusing to overwrite an existing file with empty content. "
+                    "Use a non-empty update or ask for an explicit deletion workflow."
+                ),
+            }
         if create_parents:
             target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
@@ -395,6 +528,30 @@ class SessionLogger:
             handle.write(line)
 
 
+def latest_session_dir(root: Path) -> Path | None:
+    candidates = [entry for entry in root.iterdir() if entry.is_dir()] if root.exists() else []
+    if not candidates:
+        return None
+    return max(candidates, key=lambda entry: entry.stat().st_mtime)
+
+
+def load_jsonl_records(path: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    if not path.exists():
+        return records
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            records.append(payload)
+    return records
+
+
 def build_history_reconnect_prompt(
     conversation_history: list[dict[str, str]],
     *,
@@ -423,25 +580,222 @@ class RealtimeAssistantContext:
     def __init__(
         self,
         *,
-        workspace_root: Path,
+        runtime_paths: Any,
+        session_log_root: Path,
         archive_root: Path,
         ingest_script: Path,
         codex_bridge: CodexBridgeManager,
         idea_miner: ConstellationIdeaMiner,
     ) -> None:
-        self.workspace = WorkspaceTools(workspace_root)
+        self.runtime_paths = runtime_paths
+        self.workspace = WorkspaceTools(runtime_paths.workspace_path)
+        self.mounted_libraries = [WorkspaceTools(path) for path in runtime_paths.existing_library_paths]
+        self.session_log_root = session_log_root.resolve()
         self.archive_root = archive_root.resolve()
         self.ingest_script = ingest_script.resolve()
         self.codex_bridge = codex_bridge
         self.idea_miner = idea_miner
         self.notes_index = NotesIndex(self.archive_root) if NotesIndex is not None else None
 
+    def workspace_overview(self) -> dict[str, Any]:
+        workspace_overview = self.workspace.overview()
+        mounted_library_overviews = [library.overview() for library in self.mounted_libraries]
+        return {
+            "workspace_root": workspace_overview["workspace_root"],
+            "workspace_top_level_directories": workspace_overview["top_level_directories"],
+            "workspace_top_level_files": workspace_overview["top_level_files"],
+            "mounted_library_roots": [overview["workspace_root"] for overview in mounted_library_overviews],
+            "mounted_library_summaries": [
+                {
+                    "root": overview["workspace_root"],
+                    "top_level_directories": overview["top_level_directories"][:20],
+                    "top_level_files": overview["top_level_files"][:20],
+                }
+                for overview in mounted_library_overviews
+            ],
+            "mounted_libraries_are_read_only_via_local_tools": True,
+            "codex_repository_roots": [str(root) for root in self.runtime_paths.repo_roots],
+        }
+
+    def allowed_open_roots(self) -> list[Path]:
+        return [self.workspace.root, *(library.root for library in self.mounted_libraries), self.archive_root, self.session_log_root]
+
+    def resolve_mounted_library(self, library_root: str | None = None) -> WorkspaceTools | None:
+        if not self.mounted_libraries:
+            return None
+        requested = normalize_optional_string(library_root)
+        if requested is None:
+            return self.mounted_libraries[0]
+        try:
+            requested_path = Path(requested).expanduser().resolve()
+        except OSError:
+            requested_path = None
+        requested_lower = requested.lower()
+        for library in self.mounted_libraries:
+            if requested_path is not None and library.root == requested_path:
+                return library
+            if library.root.name.lower() == requested_lower:
+                return library
+            if str(library.root).lower() == requested_lower:
+                return library
+        return None
+
+    def missing_library_error(self, requested_root: str | None = None) -> dict[str, Any]:
+        if not self.mounted_libraries:
+            return {
+                "ok": False,
+                "error": "No mounted library roots are configured.",
+                "hint": "Use `python constellation.py paths mount-library <path>` to add one on this machine.",
+            }
+        if requested_root is None:
+            return {"ok": False, "error": "Mounted library root not found."}
+        return {
+            "ok": False,
+            "error": f"Mounted library root not found: {requested_root}",
+            "available_library_roots": [str(library.root) for library in self.mounted_libraries],
+        }
+
+    def open_allowed_path(self, path_value: str) -> dict[str, Any]:
+        raw_value = normalize_optional_string(path_value)
+        if raw_value is None:
+            return {"ok": False, "error": "Path is required."}
+        candidate = Path(raw_value).expanduser()
+        allowed_roots = self.allowed_open_roots()
+        if candidate.is_absolute():
+            resolved = candidate.resolve()
+            if not any(resolved.is_relative_to(root) for root in allowed_roots):
+                return {"ok": False, "error": f"Path is outside the allowed open roots: {resolved}"}
+            if not resolved.exists():
+                return {"ok": False, "error": f"Path not found: {resolved}"}
+            try:
+                open_path(resolved)
+            except OSError as exc:
+                return {"ok": False, "error": str(exc)}
+            return {"ok": True, "path": str(resolved), "opened_in_default_app": True}
+
+        for root in allowed_roots:
+            resolved = (root / raw_value).resolve()
+            if not resolved.is_relative_to(root):
+                continue
+            if not resolved.exists():
+                continue
+            try:
+                open_path(resolved)
+            except OSError as exc:
+                return {"ok": False, "error": str(exc)}
+            return {"ok": True, "path": str(resolved), "opened_in_default_app": True}
+        return {"ok": False, "error": f"Path not found inside allowed roots: {raw_value}"}
+
+    def review_recent_runtime_session(
+        self,
+        *,
+        slow_tool_seconds: float = 8.0,
+        transcript_tail_lines: int = 12,
+    ) -> dict[str, Any]:
+        session_dir = latest_session_dir(self.session_log_root)
+        if session_dir is None:
+            return {"ok": False, "error": f"No session folders found in {self.session_log_root}"}
+        events_path = session_dir / "events.jsonl"
+        transcript_path = session_dir / "transcript.md"
+        events = load_jsonl_records(events_path)
+        transcript_lines = transcript_path.read_text(encoding="utf-8").splitlines() if transcript_path.exists() else []
+
+        pending_tools: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        slow_tools: list[dict[str, Any]] = []
+        failed_tools: list[dict[str, Any]] = []
+        session_errors: list[dict[str, Any]] = []
+
+        for event in events:
+            event_type = str(event.get("type", ""))
+            timestamp_raw = str(event.get("timestamp", ""))
+            payload = event.get("payload", {})
+            try:
+                event_timestamp = datetime.fromisoformat(timestamp_raw)
+            except ValueError:
+                event_timestamp = None
+            if event_type == "tool_call_started" and isinstance(payload, dict):
+                tool_name = str(payload.get("tool_name", "unknown_tool"))
+                pending_tools[tool_name].append(
+                    {
+                        "started_at": timestamp_raw,
+                        "timestamp": event_timestamp,
+                        "arguments": payload.get("arguments", {}),
+                    }
+                )
+                continue
+            if event_type == "tool_call_completed" and isinstance(payload, dict):
+                tool_name = str(payload.get("tool_name", "unknown_tool"))
+                result = payload.get("result", {})
+                started_entry = pending_tools[tool_name].pop(0) if pending_tools.get(tool_name) else None
+                duration_seconds: float | None = None
+                if started_entry is not None and started_entry.get("timestamp") is not None and event_timestamp is not None:
+                    duration_seconds = round((event_timestamp - started_entry["timestamp"]).total_seconds(), 3)
+                    if duration_seconds >= slow_tool_seconds:
+                        slow_tools.append(
+                            {
+                                "tool_name": tool_name,
+                                "started_at": started_entry["started_at"],
+                                "completed_at": timestamp_raw,
+                                "duration_seconds": duration_seconds,
+                                "arguments": started_entry.get("arguments", {}),
+                            }
+                        )
+                has_error = False
+                error_text: str | None = None
+                if isinstance(result, dict):
+                    has_error = result.get("ok") is False or "error" in result
+                    error_text = str(result.get("error")) if "error" in result else None
+                if has_error:
+                    failed_tools.append(
+                        {
+                            "tool_name": tool_name,
+                            "started_at": started_entry["started_at"] if started_entry is not None else None,
+                            "completed_at": timestamp_raw,
+                            "duration_seconds": duration_seconds,
+                            "error": error_text,
+                            "result": result,
+                        }
+                    )
+                continue
+            if event_type == "session_error" and isinstance(payload, dict):
+                session_errors.append(
+                    {
+                        "timestamp": timestamp_raw,
+                        "message": str(payload.get("message", "Unknown runtime error")),
+                    }
+                )
+
+        abandoned_tools: list[dict[str, Any]] = []
+        for tool_name, entries in pending_tools.items():
+            for entry in entries:
+                abandoned_tools.append(
+                    {
+                        "tool_name": tool_name,
+                        "started_at": entry.get("started_at"),
+                        "arguments": entry.get("arguments", {}),
+                    }
+                )
+
+        return {
+            "ok": True,
+            "latest_session_dir": str(session_dir),
+            "events_path": str(events_path),
+            "transcript_path": str(transcript_path),
+            "event_count": len(events),
+            "session_errors": session_errors,
+            "failed_tools": failed_tools,
+            "slow_tools": slow_tools,
+            "abandoned_tools": abandoned_tools,
+            "transcript_tail": transcript_lines[-max(1, transcript_tail_lines):],
+            "last_user_lines": [line for line in transcript_lines if "] user:" in line][-5:],
+        }
+
     def tool_definitions(self) -> list[dict[str, Any]]:
         tools = [
             {
                 "type": "function",
                 "name": "get_workspace_overview",
-                "description": "Return a high-level overview of the current coding workspace root.",
+                "description": "Return the writable workspace plus any separate read-only mounted library roots.",
                 "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
             },
             {
@@ -457,7 +811,10 @@ class RealtimeAssistantContext:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "speech_speed": {"type": "number", "description": "Voice speed from 0.75 to 2.0."},
+                        "speech_speed": {
+                            "type": "number",
+                            "description": f"Voice speed from {MIN_SPEECH_SPEED} to {MAX_SPEECH_SPEED}.",
+                        },
                         "concise_mode": {"type": "boolean", "description": "Whether to keep replies very concise by default."},
                         "thinking_sound_enabled": {"type": "boolean", "description": "Whether to play a small thinking sound while waiting on a response."},
                         "voice": {
@@ -477,7 +834,7 @@ class RealtimeAssistantContext:
             {
                 "type": "function",
                 "name": "list_directory",
-                "description": "List files or folders inside the current workspace.",
+                "description": "List files or folders inside the writable Constellation workspace.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -490,7 +847,7 @@ class RealtimeAssistantContext:
             {
                 "type": "function",
                 "name": "search_workspace",
-                "description": "Search text files in the current workspace.",
+                "description": "Search text files inside the writable Constellation workspace.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -505,7 +862,7 @@ class RealtimeAssistantContext:
             {
                 "type": "function",
                 "name": "read_file",
-                "description": "Read one UTF-8 text file from the workspace.",
+                "description": "Read one UTF-8 text file from the writable Constellation workspace.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -519,7 +876,7 @@ class RealtimeAssistantContext:
             {
                 "type": "function",
                 "name": "write_file",
-                "description": "Create or overwrite one UTF-8 text file inside the current workspace.",
+                "description": "Create or overwrite one UTF-8 text file inside the writable Constellation workspace.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -535,7 +892,7 @@ class RealtimeAssistantContext:
             {
                 "type": "function",
                 "name": "replace_text_in_file",
-                "description": "Replace a text snippet inside one UTF-8 text file in the workspace.",
+                "description": "Replace a text snippet inside one UTF-8 text file in the writable Constellation workspace.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -551,13 +908,85 @@ class RealtimeAssistantContext:
             {
                 "type": "function",
                 "name": "open_path_in_default_app",
-                "description": "Open a workspace file or folder in the operating system's default app.",
+                "description": "Open a file or folder in the default app. Relative paths are resolved inside the workspace, mounted library roots, notes archive, or session log roots. Absolute paths are allowed if they stay inside those roots.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "relative_path": {"type": "string"},
                     },
                     "required": ["relative_path"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": "list_legacy_directory",
+                "description": "List files or folders inside a mounted library root. Read-only via local tools.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "library_root": {"type": "string"},
+                        "relative_path": {"type": "string"},
+                        "max_entries": {"type": "integer", "minimum": 1, "maximum": 100},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": "search_legacy_library",
+                "description": "Search text files in a mounted library root. Read-only via local tools.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "library_root": {"type": "string"},
+                        "query": {"type": "string"},
+                        "subpath": {"type": "string"},
+                        "max_results": {"type": "integer", "minimum": 1, "maximum": 20},
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": "read_legacy_file",
+                "description": "Read one UTF-8 text file from a mounted library root. Read-only via local tools.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "library_root": {"type": "string"},
+                        "relative_path": {"type": "string"},
+                        "max_chars": {"type": "integer", "minimum": 200, "maximum": 20000},
+                    },
+                    "required": ["relative_path"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": "open_legacy_path",
+                "description": "Open a file or folder from a mounted library root in the default app. Read-only via local tools.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "library_root": {"type": "string"},
+                        "relative_path": {"type": "string"},
+                    },
+                    "required": ["relative_path"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": "review_recent_runtime_session",
+                "description": "Inspect the latest realtime session logs and transcript to self-review what happened, including failures, slow tool calls, abandoned actions, and recent user requests.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "slow_tool_seconds": {"type": "number", "minimum": 0.5, "maximum": 60},
+                        "transcript_tail_lines": {"type": "integer", "minimum": 3, "maximum": 50},
+                    },
                     "additionalProperties": False,
                 },
             },
@@ -570,7 +999,7 @@ class RealtimeAssistantContext:
             {
                 "type": "function",
                 "name": "list_codex_repositories",
-                "description": "List likely repo targets for Codex CLI work in the current workspace.",
+                "description": "List likely repo targets for Codex CLI work across the writable workspace and any mounted library roots.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -788,7 +1217,7 @@ class RealtimeAssistantContext:
 
     def execute_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         if name == "get_workspace_overview":
-            return self.workspace.overview()
+            return self.workspace_overview()
         if name == "get_runtime_preferences":
             return {"ok": False, "error": "Runtime preferences must be handled by the live session."}
         if name == "set_runtime_preferences":
@@ -826,7 +1255,42 @@ class RealtimeAssistantContext:
                 count=int(args.get("count", 1)),
             )
         if name == "open_path_in_default_app":
-            return self.workspace.open_path(relative_path=str(args.get("relative_path", "")))
+            return self.open_allowed_path(path_value=str(args.get("relative_path", "")))
+        if name == "list_legacy_directory":
+            library = self.resolve_mounted_library(normalize_optional_string(args.get("library_root")))
+            if library is None:
+                return self.missing_library_error(normalize_optional_string(args.get("library_root")))
+            return library.list_directory(
+                relative_path=normalize_optional_string(args.get("relative_path")) or "",
+                max_entries=int(args.get("max_entries", 40)),
+            )
+        if name == "search_legacy_library":
+            library = self.resolve_mounted_library(normalize_optional_string(args.get("library_root")))
+            if library is None:
+                return self.missing_library_error(normalize_optional_string(args.get("library_root")))
+            return library.search(
+                query=str(args.get("query", "")),
+                subpath=normalize_optional_string(args.get("subpath")),
+                max_results=int(args.get("max_results", 8)),
+            )
+        if name == "read_legacy_file":
+            library = self.resolve_mounted_library(normalize_optional_string(args.get("library_root")))
+            if library is None:
+                return self.missing_library_error(normalize_optional_string(args.get("library_root")))
+            return library.read_file(
+                relative_path=str(args.get("relative_path", "")),
+                max_chars=int(args.get("max_chars", 6000)),
+            )
+        if name == "open_legacy_path":
+            library = self.resolve_mounted_library(normalize_optional_string(args.get("library_root")))
+            if library is None:
+                return self.missing_library_error(normalize_optional_string(args.get("library_root")))
+            return library.open_path(relative_path=str(args.get("relative_path", "")))
+        if name == "review_recent_runtime_session":
+            return self.review_recent_runtime_session(
+                slow_tool_seconds=float(args.get("slow_tool_seconds", 8.0)),
+                transcript_tail_lines=int(args.get("transcript_tail_lines", 12)),
+            )
         if name == "get_codex_bridge_status":
             return self.codex_bridge.status()
         if name == "list_codex_repositories":
@@ -839,7 +1303,7 @@ class RealtimeAssistantContext:
                     title=normalize_optional_string(args.get("title")),
                     model=normalize_optional_string(args.get("model")),
                     sandbox=str(args.get("sandbox", "workspace-write")),
-                    approval_mode=str(args.get("approval_mode", "never")),
+                    approval_mode=str(args.get("approval_mode", DEFAULT_APPROVAL_MODE)),
                     add_dirs=[
                         str(item)
                         for item in args.get("add_dirs", [])
@@ -1227,7 +1691,7 @@ async def run_single_voice_session(
                     console_print("[you] listening...")
                     continue
                 if event_type == "input_audio_buffer.speech_stopped":
-                    thinking_indicator.start()
+                    thinking_indicator.play_handoff()
                     continue
                 if event_type == "conversation.item.input_audio_transcription.completed":
                     transcript = event.transcript.strip()
@@ -1238,7 +1702,7 @@ async def run_single_voice_session(
                         console_print(f"[you] {transcript}")
                     continue
                 if event_type == "response.created":
-                    thinking_indicator.start()
+                    thinking_indicator.start_background()
                     continue
                 if event_type == "response.output_audio.delta":
                     thinking_indicator.stop()
@@ -1300,8 +1764,10 @@ async def run_single_voice_session(
                                 ],
                             }
                         elif tool_name == "set_runtime_preferences":
+                            requested_speed: float | None = None
                             if "speech_speed" in tool_args:
-                                runtime_preferences.speech_speed = float(tool_args["speech_speed"])
+                                requested_speed = float(tool_args["speech_speed"])
+                                runtime_preferences.speech_speed = requested_speed
                             if "concise_mode" in tool_args:
                                 runtime_preferences.concise_mode = bool(tool_args["concise_mode"])
                             if "thinking_sound_enabled" in tool_args:
@@ -1334,9 +1800,7 @@ async def run_single_voice_session(
                                         ),
                                     )
                             runtime_preferences.clamp()
-                            thinking_indicator.enabled = runtime_preferences.thinking_sound_enabled
-                            if not runtime_preferences.thinking_sound_enabled:
-                                thinking_indicator.stop()
+                            thinking_indicator.set_enabled(runtime_preferences.thinking_sound_enabled)
                             tool_result = {
                                 "ok": True,
                                 "speech_speed": runtime_preferences.speech_speed,
@@ -1344,6 +1808,11 @@ async def run_single_voice_session(
                                 "thinking_sound_enabled": runtime_preferences.thinking_sound_enabled,
                                 "voice": runtime_preferences.voice,
                             }
+                            if requested_speed is not None and requested_speed != runtime_preferences.speech_speed:
+                                tool_result["note"] = (
+                                    f"Speech speed was clamped to {runtime_preferences.speech_speed:.2f}. "
+                                    f"Realtime currently supports {MIN_SPEECH_SPEED} to {MAX_SPEECH_SPEED}."
+                                )
                             if reconnect_prompt is None:
                                 await conn.session.update(
                                     session=build_session_payload(args, assistant_context, runtime_preferences)
@@ -1435,12 +1904,19 @@ async def run_voice_chat(args: argparse.Namespace) -> None:
         enabled=not args.no_session_logging,
     )
     conversation_history: list[dict[str, str]] = []
+    runtime_paths = ensure_runtime_layout(load_runtime_paths())
+    requested_workspace_root = Path(args.workspace_root).resolve()
+    if requested_workspace_root != runtime_paths.workspace_path:
+        runtime_paths.workspace_root = str(requested_workspace_root)
+        runtime_paths = ensure_runtime_layout(runtime_paths)
     assistant_context = RealtimeAssistantContext(
-        workspace_root=Path(args.workspace_root).resolve(),
+        runtime_paths=runtime_paths,
+        session_log_root=Path(args.session_log_root).resolve(),
         archive_root=Path(args.archive_root).resolve(),
         ingest_script=Path(args.ingest_script).resolve(),
         codex_bridge=CodexBridgeManager(
-            workspace_root=Path(args.workspace_root).resolve(),
+            workspace_root=runtime_paths.workspace_path,
+            repo_roots=runtime_paths.repo_roots,
             codex_command=args.codex_command,
             default_model=args.codex_model,
             provider=args.codex_provider,
@@ -1481,10 +1957,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Realtime model to use (default: {DEFAULT_MODEL}).")
     parser.add_argument("--voice", default=DEFAULT_VOICE, help=f"Voice to use (default: {DEFAULT_VOICE}).")
     parser.add_argument("--list-voices", action="store_true", help="List supported realtime voices and exit.")
-    parser.add_argument("--speech-speed", type=float, default=DEFAULT_SPEECH_SPEED, help=f"Initial speech speed (default: {DEFAULT_SPEECH_SPEED}).")
+    parser.add_argument(
+        "--speech-speed",
+        type=float,
+        default=DEFAULT_SPEECH_SPEED,
+        help=f"Initial speech speed from {MIN_SPEECH_SPEED} to {MAX_SPEECH_SPEED} (default: {DEFAULT_SPEECH_SPEED}).",
+    )
     parser.add_argument("--verbose-responses", action="store_true", help="Allow more detailed default replies instead of concise mode.")
     parser.add_argument("--transcription-model", default="gpt-4o-mini-transcribe", help="Input transcription model.")
-    parser.add_argument("--workspace-root", default=str(WORKSPACE_ROOT), help="Workspace root to expose to file tools.")
+    parser.add_argument(
+        "--workspace-root",
+        default=str(WORKSPACE_ROOT),
+        help="Writable workspace root for direct file tools and the default Codex scratch area.",
+    )
     parser.add_argument("--archive-root", default=str(DEFAULT_NOTES_ARCHIVE_ROOT), help="Voice notes archive root.")
     parser.add_argument("--ingest-script", default=str(DEFAULT_NOTES_INGEST_SCRIPT), help="Voice notes ingest script path.")
     parser.add_argument("--temperature", type=float, help="Optional sampling temperature.")
@@ -1500,7 +1985,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-greeting", action="store_true", help="Do not make the assistant greet on startup.")
     parser.add_argument("--no-mic", action="store_true", help="Do not capture microphone input.")
     parser.add_argument("--no-audio-output", action="store_true", help="Do not play assistant audio; print text only.")
-    parser.add_argument("--no-thinking-sound", action="store_true", help="Disable the local thinking indicator sound.")
+    parser.add_argument(
+        "--no-thinking-sound",
+        action="store_true",
+        help="Disable the local handoff and background work indicator sounds.",
+    )
     parser.add_argument(
         "--session-log-root",
         default=str(DEFAULT_SESSION_LOG_ROOT),
@@ -1576,6 +2065,10 @@ async def async_main(args: argparse.Namespace) -> int:
         print_audio_devices()
         return 0
     if args.tray and not args.tray_child:
+        tray_guard = SingleInstanceGuard("constellation_realtime_tray")
+        if not tray_guard.try_acquire():
+            console_print("Constellation tray is already running.")
+            return 0
         run_realtime_tray(args)
         return 0
 

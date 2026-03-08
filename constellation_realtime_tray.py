@@ -20,7 +20,7 @@ LOG_PATH = SCRIPT_DIR / "toolbelt" / "realtime_voice.log"
 @dataclass
 class RealtimeTraySettings:
     voice: str = "verse"
-    auto_start: bool = True
+    auto_start: bool = False
 
     def clamp(self) -> None:
         self.voice = normalize_voice_name(self.voice) or "verse"
@@ -234,6 +234,15 @@ class RealtimeTrayController:
         with IgnoreErrors():
             icon.update_menu()
 
+    def toggle_session(self, icon: Any, item: Any) -> None:
+        if self.is_running():
+            self.stop_session(icon, item)
+            return
+        self.start_session(icon, item)
+
+    def toggle_session_label(self) -> str:
+        return "Disable Voice Mode" if self.is_running() else "Enable Voice Mode"
+
     def build_child_command(self) -> list[str]:
         script_path = SCRIPT_DIR / "voice_notes_realtime.py"
         command = [
@@ -380,6 +389,7 @@ def run_realtime_tray(args: Any) -> None:
     menu = pystray.Menu(
         pystray.MenuItem(lambda item: f"Status: {controller.status}", None, enabled=False),
         pystray.MenuItem(lambda item: controller.detail, None, enabled=False),
+        pystray.MenuItem(lambda item: controller.toggle_session_label(), controller.toggle_session, default=True),
         pystray.MenuItem("Start Voice Session", controller.start_session),
         pystray.MenuItem("Restart Voice Session", controller.restart_session),
         pystray.MenuItem("Stop Voice Session", controller.stop_session),

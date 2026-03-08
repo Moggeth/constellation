@@ -25,7 +25,7 @@ DEFAULT_CODEX_COMMAND = os.getenv(
 )
 DEFAULT_CODEX_MODEL = os.getenv("CONSTELLATION_CODEX_MODEL", "gpt-5.4")
 DEFAULT_SANDBOX = os.getenv("CONSTELLATION_CODEX_SANDBOX", "workspace-write")
-DEFAULT_APPROVAL_MODE = os.getenv("CONSTELLATION_CODEX_APPROVAL_MODE", "never")
+DEFAULT_APPROVAL_MODE = os.getenv("CONSTELLATION_CODEX_APPROVAL_MODE", "on-request")
 DEFAULT_PROVIDER = os.getenv("CONSTELLATION_CODEX_PROVIDER", "native")
 DEFAULT_WSL_DISTRO = os.getenv("CONSTELLATION_CODEX_WSL_DISTRO", "Ubuntu-22.04")
 ALLOWED_SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
@@ -101,6 +101,7 @@ class CodexBridgeManager:
         self,
         workspace_root: Path,
         *,
+        repo_roots: list[Path] | None = None,
         codex_command: str = DEFAULT_CODEX_COMMAND,
         default_model: str = DEFAULT_CODEX_MODEL,
         runs_root: Path = RUNS_ROOT,
@@ -108,6 +109,12 @@ class CodexBridgeManager:
         wsl_distro: str = DEFAULT_WSL_DISTRO,
     ) -> None:
         self.workspace_root = workspace_root.resolve()
+        normalized_repo_roots = [self.workspace_root]
+        for root in repo_roots or []:
+            resolved_root = Path(root).resolve()
+            if resolved_root not in normalized_repo_roots:
+                normalized_repo_roots.append(resolved_root)
+        self.repo_roots = normalized_repo_roots
         self.codex_command = codex_command
         self.default_model = default_model
         self.runs_root = runs_root.resolve()
@@ -222,21 +229,30 @@ class CodexBridgeManager:
 
     def discover_repositories(self, max_repos: int = 20) -> list[dict[str, Any]]:
         repositories: list[dict[str, Any]] = []
-        for entry in sorted(self.workspace_root.iterdir(), key=lambda item: item.name.lower()):
-            if not entry.is_dir() or entry.name.startswith("."):
+        seen_paths: set[str] = set()
+        for root in self.repo_roots:
+            if not root.exists():
                 continue
-            git_marker = entry / ".git"
-            if not git_marker.exists():
-                continue
-            repositories.append(
-                {
-                    "name": entry.name,
-                    "path": str(entry.resolve()),
-                    "git_repository": True,
-                }
-            )
-            if len(repositories) >= max_repos:
-                break
+            for entry in sorted(root.iterdir(), key=lambda item: item.name.lower()):
+                if not entry.is_dir() or entry.name.startswith("."):
+                    continue
+                git_marker = entry / ".git"
+                if not git_marker.exists():
+                    continue
+                resolved_entry = str(entry.resolve())
+                if resolved_entry in seen_paths:
+                    continue
+                seen_paths.add(resolved_entry)
+                repositories.append(
+                    {
+                        "name": entry.name,
+                        "path": resolved_entry,
+                        "git_repository": True,
+                        "root": str(root),
+                    }
+                )
+                if len(repositories) >= max_repos:
+                    return repositories
         return repositories
 
     def resolve_repo(self, repo_name_or_path: str | None) -> tuple[Path, bool, str]:
@@ -249,6 +265,15 @@ class CodexBridgeManager:
                 candidate = direct
             else:
                 candidate = self.workspace_root / raw_value
+                if not candidate.exists():
+                    candidate = next(
+                        (
+                            root / raw_value
+                            for root in self.repo_roots
+                            if (root / raw_value).exists()
+                        ),
+                        candidate,
+                    )
                 if not candidate.exists():
                     match = next(
                         (
@@ -273,6 +298,7 @@ class CodexBridgeManager:
         resolved_command = self._resolve_native_command() if self.provider == "native" else self.codex_command
         payload: dict[str, Any] = {
             "workspace_root": str(self.workspace_root),
+            "repository_roots": [str(root) for root in self.repo_roots],
             "codex_command": self.codex_command,
             "command_path": resolved_command,
             "default_model": self.default_model,

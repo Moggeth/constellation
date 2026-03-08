@@ -16,6 +16,7 @@ This repo is the canonical local home of `Constellation`, a voice-first system f
 - `python constellation.py codex status`
 - `python constellation.py codex repos`
 - `python constellation.py codex run --repo <repo> "<task>"`
+- `python constellation.py paths show`
 
 ## Preferred Behavior
 
@@ -32,7 +33,17 @@ This repo is the canonical local home of `Constellation`, a voice-first system f
   - `events.jsonl` contains tool calls, tool results, and session lifecycle events.
 - Codex run records live in `toolbelt/codex_runs/<task_id>/`.
 - Tray session output also lands in `toolbelt/realtime_voice.log`.
+- Machine-specific runtime paths live in `toolbelt/runtime_paths.json`.
 - These runtime artifacts are intentionally local and ignored by Git.
+
+If the user says "review the logs", "introspect on the last session", or "self-reflect on the last session", treat that as a concrete workflow:
+
+1. Inspect the newest folder under `toolbelt/realtime_sessions/`.
+2. Read `transcript.md` to understand the user request flow.
+3. Read `events.jsonl` to inspect tool calls, timings, failures, reconnects, and errors.
+4. Check `toolbelt/realtime_voice.log` for tray/session startup context when relevant.
+5. Summarize what went wrong, what was slow, and what should be fixed.
+6. If the user asked for improvements, implement the runtime or prompt changes instead of stopping at analysis.
 
 ## New Thread Checklist
 
@@ -49,6 +60,8 @@ When starting a fresh Codex thread in this repo:
 - Do not revert user changes unless explicitly asked.
 - Do not assume the realtime runtime can open arbitrary external apps unless a tool exists for it.
 - Keep changes local-first and practical.
+- Treat `workspace/` as the default writable scratch area for this repo.
+- Treat any mounted library roots as read-only local context unless the user explicitly asks to modify one through Codex.
 - Avoid broad refactors unless they clearly support the Constellation runtime, toolbelt, or note-to-action workflow.
 
 ## Naming Notes
@@ -56,3 +69,4 @@ When starting a fresh Codex thread in this repo:
 - `Constellation` is the umbrella name.
 - Some `faq_notes_*` filenames remain for compatibility.
 - The current repo/folder is canonical even where legacy names still appear internally.
+- Personal archive roots such as `things_are_different_now` are optional mounted libraries, not required runtime dependencies.

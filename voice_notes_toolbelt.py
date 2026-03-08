@@ -21,6 +21,8 @@ VOICE_CHANGE_REQUIRES_RECONNECT = (
     "The assistant can switch automatically and then continue in the new voice."
 )
 
+MIN_SPEECH_SPEED = 0.75
+MAX_SPEECH_SPEED = 1.5
 DEFAULT_SPEECH_SPEED = 1.2
 
 
@@ -32,7 +34,7 @@ class RuntimePreferences:
     voice: str = "alloy"
 
     def clamp(self) -> None:
-        self.speech_speed = max(0.75, min(2.0, self.speech_speed))
+        self.speech_speed = max(MIN_SPEECH_SPEED, min(MAX_SPEECH_SPEED, self.speech_speed))
         self.voice = normalize_voice_name(self.voice) or "alloy"
 
 

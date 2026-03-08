@@ -24,6 +24,8 @@ import json
 import math
 import os
 import platform
+import plistlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -32,7 +34,7 @@ import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -101,6 +103,357 @@ class Device:
     path: Path
 
 
+@dataclass
+class AppRuntimeState:
+    quiet: bool = False
+    log_file: Path | None = None
+    tray_controller: Any = None
+
+
+@dataclass
+class TrayPreferences:
+    notify_on_import_start: bool = True
+    notify_on_import_complete: bool = True
+
+    def to_dict(self) -> dict[str, bool]:
+        return {
+            "notify_on_import_start": self.notify_on_import_start,
+            "notify_on_import_complete": self.notify_on_import_complete,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "TrayPreferences":
+        return cls(
+            notify_on_import_start=bool(payload.get("notify_on_import_start", True)),
+            notify_on_import_complete=bool(payload.get("notify_on_import_complete", True)),
+        )
+
+
+@dataclass
+class TrayController:
+    args: argparse.Namespace
+    archive_root: Path
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    state_lock: threading.Lock = field(default_factory=threading.Lock)
+    scan_lock: threading.Lock = field(default_factory=threading.Lock)
+    activity_lock: threading.Lock = field(default_factory=threading.Lock)
+    icon: Any = None
+    preferences: TrayPreferences = field(default_factory=TrayPreferences)
+    paused: bool = False
+    restart_requested: bool = False
+    restart_message: str = "Restarting tray service."
+    relaunch_scheduled: bool = False
+    code_reload_pending: bool = False
+    code_reload_notice_sent: bool = False
+    pending_restart_message: str = "Restarting tray service."
+    active_tasks: int = 0
+    animation_frame: int = 0
+    status_text: str = "Starting"
+    last_event: str = "Initializing"
+    last_scan: str = "Not yet run"
+
+    def bind_icon(self, icon: Any) -> None:
+        self.icon = icon
+        self._apply_icon_frame(0)
+        worker = threading.Thread(target=self._animation_loop, daemon=True)
+        worker.start()
+        watcher = threading.Thread(target=self._code_watch_loop, daemon=True)
+        watcher.start()
+
+    def update_status(
+        self,
+        *,
+        status_text: str | None = None,
+        last_event: str | None = None,
+        last_scan: str | None = None,
+    ) -> None:
+        with self.state_lock:
+            if status_text is not None:
+                self.status_text = status_text
+            if last_event is not None:
+                self.last_event = last_event
+            if last_scan is not None:
+                self.last_scan = last_scan
+        if self.icon is not None:
+            try:
+                self.icon.update_menu()
+            except Exception:
+                pass
+
+    def notify(self, title: str, message: str) -> None:
+        if self.icon is None:
+            return
+        try:
+            self.icon.notify(message, title)
+        except Exception:
+            pass
+
+    def save_preferences(self) -> None:
+        save_tray_preferences(self.archive_root, self.preferences)
+
+    def _apply_icon_frame(self, frame_index: int) -> None:
+        if self.icon is None:
+            return
+        try:
+            self.icon.icon = build_tray_image(self._icon_mode(), frame_index if self.active_tasks else 0)
+        except Exception:
+            pass
+
+    def _icon_mode(self) -> str:
+        with self.state_lock:
+            paused = self.paused
+            status_text = self.status_text
+            code_reload_pending = self.code_reload_pending
+            restart_requested = self.restart_requested
+        with self.activity_lock:
+            active_tasks = self.active_tasks
+
+        if restart_requested or status_text == "Restarting":
+            return "restarting"
+        if active_tasks > 0:
+            return "active"
+        if code_reload_pending:
+            return "update_pending"
+        if paused:
+            return "paused"
+        return "monitoring"
+
+    def _animation_loop(self) -> None:
+        while not self.stop_event.wait(0.18):
+            with self.activity_lock:
+                if self.active_tasks <= 0:
+                    continue
+                self.animation_frame = (self.animation_frame + 1) % 8
+                frame_index = self.animation_frame
+            self._apply_icon_frame(frame_index)
+
+    def begin_activity(self) -> None:
+        with self.activity_lock:
+            self.active_tasks += 1
+            if self.active_tasks == 1:
+                self.animation_frame = 0
+            frame_index = self.animation_frame
+        self._apply_icon_frame(frame_index)
+
+    def end_activity(self) -> None:
+        with self.activity_lock:
+            if self.active_tasks > 0:
+                self.active_tasks -= 1
+            if self.active_tasks == 0:
+                self.animation_frame = 0
+            frame_index = self.animation_frame
+        self._apply_icon_frame(frame_index)
+        if self.active_tasks == 0 and self.code_reload_pending:
+            with self.state_lock:
+                self.code_reload_pending = False
+                self.code_reload_notice_sent = False
+            self.request_restart("Code changes detected. Restarting tray service.")
+
+    def toggle_notify_on_import_start(self, icon: Any, item: Any) -> None:
+        self.preferences.notify_on_import_start = not self.preferences.notify_on_import_start
+        self.save_preferences()
+        self.update_status(last_event="Updated notification preference.")
+
+    def toggle_notify_on_import_complete(self, icon: Any, item: Any) -> None:
+        self.preferences.notify_on_import_complete = not self.preferences.notify_on_import_complete
+        self.save_preferences()
+        self.update_status(last_event="Updated notification preference.")
+
+    def can_restart_now(self) -> bool:
+        return not self.scan_lock.locked() and self.active_tasks <= 0
+
+    def request_restart(self, message: str, *, pending_message: str | None = None) -> bool:
+        if self.can_restart_now():
+            with self.state_lock:
+                self.restart_requested = True
+                self.restart_message = message
+                if not self.relaunch_scheduled:
+                    try:
+                        schedule_relaunch_tray_process(self.args)
+                        self.relaunch_scheduled = True
+                    except OSError as exc:
+                        log_status("warning", f"Failed to schedule tray relaunch: {exc}")
+            self.update_status(status_text="Restarting", last_event=message)
+            self.notify("FAQ Notes Tool", message)
+            self.stop_event.set()
+            if self.icon is not None:
+                self.icon.stop()
+            return True
+        with self.state_lock:
+            self.code_reload_pending = True
+            self.pending_restart_message = message
+        if not self.code_reload_notice_sent:
+            self.code_reload_notice_sent = True
+            queued_message = pending_message or "Restart queued after the current import finishes."
+            self.update_status(last_event=queued_message)
+            self.notify("FAQ Notes Tool", queued_message)
+        return False
+
+    def _code_watch_loop(self) -> None:
+        previous_state = capture_code_watch_state(SCRIPT_DIR, self.archive_root)
+        while not self.stop_event.wait(1.5):
+            current_state = capture_code_watch_state(SCRIPT_DIR, self.archive_root)
+            if current_state == previous_state:
+                continue
+            previous_state = current_state
+            if self.request_restart(
+                "Code changes detected. Restarting tray service.",
+                pending_message="Code changes detected. Restart queued after the current import finishes.",
+            ):
+                return
+
+    def flush_pending_restart(self) -> None:
+        if self.code_reload_pending and self.can_restart_now():
+            with self.state_lock:
+                pending_message = self.pending_restart_message
+                self.code_reload_pending = False
+                self.code_reload_notice_sent = False
+            self.request_restart(pending_message)
+
+    def snapshot(self) -> tuple[str, str, str, bool]:
+        with self.state_lock:
+            return self.status_text, self.last_event, self.last_scan, self.paused
+
+    def set_paused(self, paused: bool) -> None:
+        status = "Paused" if paused else "Monitoring"
+        message = "Monitoring paused." if paused else "Monitoring resumed."
+        with self.state_lock:
+            self.paused = paused
+        self.update_status(status_text=status, last_event=message)
+        self.notify("FAQ Notes Tool", message)
+
+    def toggle_paused(self, icon: Any, item: Any) -> None:
+        _, _, _, paused = self.snapshot()
+        self.set_paused(not paused)
+
+    def open_archive_folder(self, icon: Any, item: Any) -> None:
+        open_with_shell(self.archive_root)
+
+    def open_log_file(self, icon: Any, item: Any) -> None:
+        log_path = APP_RUNTIME.log_file
+        if log_path is None:
+            return
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        if not log_path.exists():
+            atomic_write_text(log_path, "", encoding="utf-8")
+        open_with_shell(log_path)
+
+    def scan_now(self, icon: Any, item: Any) -> None:
+        self.run_scan_async(
+            reason="Manual scan",
+            include_existing_approved=True,
+            prompt_for_new=True,
+        )
+
+    def run_scan_async(
+        self,
+        *,
+        reason: str,
+        include_existing_approved: bool,
+        prompt_for_new: bool,
+    ) -> None:
+        worker = threading.Thread(
+            target=self._scan_worker,
+            kwargs={
+                "reason": reason,
+                "include_existing_approved": include_existing_approved,
+                "prompt_for_new": prompt_for_new,
+            },
+            daemon=True,
+        )
+        worker.start()
+
+    def _scan_worker(
+        self,
+        *,
+        reason: str,
+        include_existing_approved: bool,
+        prompt_for_new: bool,
+    ) -> None:
+        if not self.scan_lock.acquire(blocking=False):
+            self.notify("FAQ Notes Tool", "A scan is already running.")
+            return
+
+        self.update_status(status_text="Scanning", last_event=reason)
+        try:
+            _, processed_files = process_discovered_devices(
+                self.args,
+                set(),
+                include_existing_approved=include_existing_approved,
+                prompt_for_new=prompt_for_new,
+            )
+            if processed_files:
+                summary = f"{reason}: processed {processed_files} new file(s)."
+            else:
+                summary = f"{reason}: no new files found."
+            next_status = "Paused" if self.snapshot()[3] else "Monitoring"
+            self.update_status(status_text=next_status, last_event=summary, last_scan=summary)
+            if processed_files == 0:
+                self.notify("FAQ Notes Tool", summary)
+        except Exception as exc:
+            message = f"{reason} failed: {exc}"
+            next_status = "Paused" if self.snapshot()[3] else "Monitoring"
+            self.update_status(status_text=next_status, last_event=message, last_scan=message)
+            self.notify("FAQ Notes Tool", message)
+        finally:
+            self.scan_lock.release()
+            self.flush_pending_restart()
+
+    def on_quit(self, icon: Any, item: Any) -> None:
+        self.stop_event.set()
+        icon.stop()
+
+    def restart_service(self, icon: Any, item: Any) -> None:
+        if not self.request_restart(
+            "Restarting tray service.",
+            pending_message="Restart queued after the current import finishes.",
+        ):
+            self.update_status(last_event="Restart deferred: scan still in progress.")
+
+    def run_watch_loop(self) -> None:
+        self.update_status(status_text="Monitoring", last_event="Tray mode enabled.")
+        log_status("success", "Tray mode enabled.")
+        log_status("info", "Waiting for newly connected devices.")
+        with self.scan_lock:
+            seen_ids, startup_processed = process_discovered_devices(
+                self.args,
+                set(),
+                include_existing_approved=True,
+                prompt_for_new=False,
+            )
+        if startup_processed:
+            summary = f"Startup scan: processed {startup_processed} new file(s)."
+            self.update_status(last_event=summary, last_scan=summary)
+            self.notify("FAQ Notes Tool", summary)
+
+        interval = max(2, self.args.interval)
+        while not self.stop_event.is_set():
+            if self.stop_event.wait(interval):
+                break
+            if self.snapshot()[3]:
+                continue
+            if self.scan_lock.locked():
+                continue
+            self.update_status(status_text="Monitoring", last_event="Watching for newly connected devices.")
+            if not self.scan_lock.acquire(blocking=False):
+                continue
+            try:
+                seen_ids, processed_files = process_discovered_devices(
+                    self.args,
+                    seen_ids,
+                    prompt_for_new=True,
+                )
+            finally:
+                self.scan_lock.release()
+                self.flush_pending_restart()
+            if processed_files:
+                summary = f"Auto-transfer complete: processed {processed_files} new file(s)."
+                self.update_status(last_event=summary, last_scan=summary)
+
+
+APP_RUNTIME = AppRuntimeState()
+
+
 def enable_windows_ansi() -> bool:
     if os.name != "nt":
         return True
@@ -147,16 +500,37 @@ def color_text(text: str, tone: str = "", bold: bool = False) -> str:
 
 
 def log_status(kind: str, message: str, *, leading_blank: bool = False) -> None:
-    if leading_blank:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if APP_RUNTIME.log_file is not None:
+        try:
+            APP_RUNTIME.log_file.parent.mkdir(parents=True, exist_ok=True)
+            with APP_RUNTIME.log_file.open("a", encoding="utf-8") as handle:
+                handle.write(f"{timestamp} [{kind.upper()}] {message}\n")
+        except OSError:
+            pass
+    if leading_blank and not APP_RUNTIME.quiet:
         print()
     label = LOG_LABELS.get(kind, "INFO")
     label_text = color_text(f"[{label}]", tone=kind, bold=True)
-    print(f"{label_text} {message}")
+    if not APP_RUNTIME.quiet:
+        print(f"{label_text} {message}")
+    tray = APP_RUNTIME.tray_controller
+    if tray is not None:
+        tray.update_status(last_event=message)
 
 
 def log_detail(label: str, value: Any) -> None:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if APP_RUNTIME.log_file is not None:
+        try:
+            APP_RUNTIME.log_file.parent.mkdir(parents=True, exist_ok=True)
+            with APP_RUNTIME.log_file.open("a", encoding="utf-8") as handle:
+                handle.write(f"{timestamp} [DETAIL] {label}: {value}\n")
+        except OSError:
+            pass
     label_text = color_text(f"{label}:", tone="muted", bold=True)
-    print(f"  {label_text} {value}")
+    if not APP_RUNTIME.quiet:
+        print(f"  {label_text} {value}")
 
 
 class SourceUnavailableError(RuntimeError):
@@ -1222,11 +1596,54 @@ def discover_linux_devices() -> list[Device]:
     return sorted(unique.values(), key=lambda d: d.path.as_posix().lower())
 
 
+def macos_volume_info(path: Path) -> dict[str, Any]:
+    if shutil.which("diskutil") is None:
+        return {}
+    try:
+        result = run_checked(["diskutil", "info", "-plist", str(path)])
+        return plistlib.loads(result.stdout.encode("utf-8"))
+    except Exception:
+        return {}
+
+
+def discover_macos_devices() -> list[Device]:
+    volumes_root = Path("/Volumes")
+    if not volumes_root.exists():
+        return []
+
+    devices: list[Device] = []
+    for path in sorted(volumes_root.iterdir(), key=lambda entry: entry.name.lower()):
+        if not path.is_dir():
+            continue
+        info = macos_volume_info(path)
+        if info.get("Internal") is True:
+            continue
+        stable_token = (
+            info.get("VolumeUUID")
+            or info.get("DiskUUID")
+            or info.get("DeviceIdentifier")
+            or path.as_posix()
+        )
+        display_name = info.get("VolumeName") or path.name
+        devices.append(
+            Device(
+                device_id=f"macvol:{stable_token}",
+                name=f"{display_name} ({path})",
+                path=path,
+            )
+        )
+
+    return devices
+
+
 def discover_devices() -> list[Device]:
     if os.name == "nt":
         return discover_windows_devices()
-    if platform.system().lower() == "linux":
+    system_name = platform.system().lower()
+    if system_name == "linux":
         return discover_linux_devices()
+    if system_name == "darwin":
+        return discover_macos_devices()
     return []
 
 
@@ -1304,6 +1721,254 @@ def make_archive_paths(archive_root: Path) -> tuple[Path, Path]:
     return archive_root, manifest_path
 
 
+def tray_settings_path(archive_root: Path) -> Path:
+    return archive_root / "tray_settings.json"
+
+
+def load_tray_preferences(archive_root: Path) -> TrayPreferences:
+    path = tray_settings_path(archive_root)
+    if not path.exists():
+        return TrayPreferences()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("tray settings root must be an object")
+        return TrayPreferences.from_dict(payload)
+    except Exception as exc:
+        log_status("warning", f"Failed to read tray settings at {path}: {exc}")
+        return TrayPreferences()
+
+
+def save_tray_preferences(archive_root: Path, preferences: TrayPreferences) -> None:
+    path = tray_settings_path(archive_root)
+    atomic_write_text(path, json.dumps(preferences.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+
+
+def should_watch_code_file(path: Path) -> bool:
+    if path.name.startswith("."):
+        return False
+    if path.suffix == ".py":
+        return True
+    return path.name in {"requirements.txt", "pyproject.toml"}
+
+
+def capture_code_watch_state(project_root: Path, archive_root: Path) -> dict[str, tuple[int, int]]:
+    state: dict[str, tuple[int, int]] = {}
+    project_root = project_root.resolve()
+    archive_root = archive_root.resolve()
+    skip_dirs = {".git", "__pycache__", ".venv", "venv", ".mypy_cache", ".pytest_cache"}
+
+    for dir_path, dir_names, file_names in os.walk(project_root):
+        current_dir = Path(dir_path)
+        dir_names[:] = [
+            name
+            for name in dir_names
+            if name not in skip_dirs and (current_dir / name).resolve() != archive_root
+        ]
+        for file_name in file_names:
+            path = current_dir / file_name
+            if path.resolve() == APP_RUNTIME.log_file:
+                continue
+            if not should_watch_code_file(path):
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            state[str(path.resolve())] = (stat.st_mtime_ns, stat.st_size)
+    return state
+
+
+def resolve_log_file_path(args: argparse.Namespace, archive_root: Path) -> Path | None:
+    if args.log_file:
+        return Path(args.log_file).expanduser().resolve()
+    if args.tray:
+        return (archive_root / "faq_notes.log").resolve()
+    return None
+
+
+def configure_runtime(args: argparse.Namespace) -> None:
+    archive_root = resolve_archive_root(args.archive_root)
+    APP_RUNTIME.quiet = bool(args.quiet)
+    APP_RUNTIME.log_file = resolve_log_file_path(args, archive_root)
+    APP_RUNTIME.tray_controller = None
+
+
+def open_with_shell(path: Path) -> None:
+    resolved = path.resolve()
+    if os.name == "nt":
+        os.startfile(str(resolved))
+        return
+    opener = "open" if platform.system().lower() == "darwin" else "xdg-open"
+    subprocess.Popen([opener, str(resolved)])
+
+
+def startup_launcher_path() -> Path:
+    system_name = platform.system().lower()
+    if system_name == "windows":
+        appdata = Path(os.environ["APPDATA"])
+        return appdata / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / "FAQ Notes Tool.vbs"
+    if system_name == "linux":
+        return Path.home() / ".config" / "autostart" / "faq-notes-tool.desktop"
+    if system_name == "darwin":
+        return Path.home() / "Library" / "LaunchAgents" / "com.faqnotestool.agent.plist"
+    raise SystemExit(f"Automatic startup is not supported on {platform.system()}.")
+
+
+def startup_python_executable() -> Path:
+    executable = Path(sys.executable).resolve()
+    if platform.system().lower() == "windows":
+        candidate = executable.with_name("python.exe")
+        if candidate.exists():
+            return candidate
+    return executable
+
+
+def build_tray_launch_command(args: argparse.Namespace, *, force_quiet: bool) -> list[str]:
+    command = [str(startup_python_executable()), str(Path(__file__).resolve()), "--tray"]
+    if force_quiet or args.quiet:
+        command.append("--quiet")
+    if args.archive_root != DEFAULT_ARCHIVE_SUBDIR:
+        command.extend(["--archive-root", args.archive_root])
+    if args.interval != 10:
+        command.extend(["--interval", str(args.interval)])
+    if args.workers != default_worker_count():
+        command.extend(["--workers", str(args.workers)])
+    if args.dedupe_mode != "fast":
+        command.extend(["--dedupe-mode", args.dedupe_mode])
+    if args.storage_backend != "json":
+        command.extend(["--storage-backend", args.storage_backend])
+    if args.account_id:
+        command.extend(["--account-id", args.account_id])
+    if args.database_url:
+        command.extend(["--database-url", args.database_url])
+    if args.no_color:
+        command.append("--no-color")
+    if args.log_file:
+        command.extend(["--log-file", args.log_file])
+    return command
+
+
+def build_startup_args(args: argparse.Namespace) -> list[str]:
+    return build_tray_launch_command(args, force_quiet=True)
+
+
+def relaunch_tray_process(args: argparse.Namespace) -> None:
+    command = build_tray_launch_command(args, force_quiet=False)
+    popen_kwargs: dict[str, Any] = {
+        "args": command,
+        "cwd": str(SCRIPT_DIR),
+        "close_fds": True,
+    }
+    if platform.system().lower() == "windows":
+        creationflags = (
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+        popen_kwargs["creationflags"] = creationflags
+    subprocess.Popen(**popen_kwargs)
+
+
+def schedule_relaunch_tray_process(args: argparse.Namespace, delay_seconds: float = 1.0) -> None:
+    command = build_tray_launch_command(args, force_quiet=False)
+    child_flags = 0
+    helper_flags = 0
+    system_name = platform.system().lower()
+    if system_name == "windows":
+        child_flags = (
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+        helper_flags = child_flags
+        launcher_path = startup_launcher_path()
+        if launcher_path.exists():
+            subprocess.Popen(
+                ["wscript.exe", str(launcher_path)],
+                cwd=str(SCRIPT_DIR),
+                close_fds=True,
+                creationflags=child_flags,
+            )
+            return
+
+    helper_code = (
+        "import subprocess, time\n"
+        f"time.sleep({delay_seconds})\n"
+        f"subprocess.Popen({command!r}, cwd={str(SCRIPT_DIR)!r}, close_fds=True, creationflags={child_flags})\n"
+    )
+    helper_kwargs: dict[str, Any] = {
+        "args": [str(startup_python_executable()), "-c", helper_code],
+        "cwd": str(SCRIPT_DIR),
+        "close_fds": True,
+    }
+    if helper_flags:
+        helper_kwargs["creationflags"] = helper_flags
+    subprocess.Popen(**helper_kwargs)
+
+
+def vbscript_escape(value: str) -> str:
+    return value.replace('"', '""')
+
+
+def install_startup_launcher(args: argparse.Namespace) -> Path:
+    launcher_path = startup_launcher_path()
+    launcher_path.parent.mkdir(parents=True, exist_ok=True)
+    command = build_startup_args(args)
+    system_name = platform.system().lower()
+
+    if system_name == "windows":
+        command_text = " ".join(f'"{part}"' for part in command)
+        working_dir = vbscript_escape(str(SCRIPT_DIR))
+        script = (
+            'Set shell = CreateObject("WScript.Shell")\n'
+            f'shell.CurrentDirectory = "{working_dir}"\n'
+            f'shell.Run "{vbscript_escape(command_text)}", 0, False\n'
+        )
+        atomic_write_text(launcher_path, script, encoding="utf-8")
+        return launcher_path
+
+    if system_name == "linux":
+        exec_line = " ".join(shlex.quote(part) for part in command)
+        desktop_entry = (
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Version=1.0\n"
+            "Name=FAQ Notes Tool\n"
+            "Comment=Run FAQ Notes Tool in tray mode at login\n"
+            f"Exec={exec_line}\n"
+            f"Path={SCRIPT_DIR}\n"
+            "Terminal=false\n"
+            "X-GNOME-Autostart-enabled=true\n"
+        )
+        atomic_write_text(launcher_path, desktop_entry, encoding="utf-8")
+        return launcher_path
+
+    if system_name == "darwin":
+        plist_payload = {
+            "Label": "com.faqnotestool.agent",
+            "ProgramArguments": command,
+            "RunAtLoad": True,
+            "WorkingDirectory": str(SCRIPT_DIR),
+            "ProcessType": "Interactive",
+            "StandardOutPath": str(resolve_log_file_path(args, resolve_archive_root(args.archive_root)) or (resolve_archive_root(args.archive_root) / "faq_notes.log")),
+            "StandardErrorPath": str(resolve_log_file_path(args, resolve_archive_root(args.archive_root)) or (resolve_archive_root(args.archive_root) / "faq_notes.log")),
+        }
+        launcher_path.write_bytes(plistlib.dumps(plist_payload, sort_keys=True))
+        return launcher_path
+
+    raise SystemExit(f"Automatic startup is not supported on {platform.system()}.")
+    return launcher_path
+
+
+def remove_startup_launcher() -> bool:
+    launcher_path = startup_launcher_path()
+    if not launcher_path.exists():
+        return False
+    launcher_path.unlink()
+    return True
+
+
 def copied_filename(captured_at: datetime, file_hash: str, suffix: str) -> str:
     timestamp = captured_at.strftime("%Y%m%d_%H%M%S")
     token = hashlib.blake2s(file_hash.encode("utf-8"), digest_size=4).hexdigest()
@@ -1330,6 +1995,85 @@ def prompt_yes_no_windows(message: str, title: str, default_yes: bool = False) -
     return result == 6  # IDYES
 
 
+def prompt_yes_no_macos(message: str, title: str, default_yes: bool = False) -> bool | None:
+    if platform.system().lower() != "darwin" or shutil.which("osascript") is None:
+        return None
+    escaped_message = message.replace("\\", "\\\\").replace('"', '\\"')
+    escaped_title = title.replace("\\", "\\\\").replace('"', '\\"')
+    default_button = "Yes" if default_yes else "No"
+    script = (
+        f'display dialog "{escaped_message}" with title "{escaped_title}" '
+        'buttons {"No", "Yes"} '
+        f'default button "{default_button}"'
+    )
+    result = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        return "button returned:Yes" in result.stdout
+    return False
+
+
+def prompt_yes_no_linux(message: str, title: str) -> bool | None:
+    if platform.system().lower() != "linux" or shutil.which("zenity") is None:
+        return None
+    result = subprocess.run(
+        ["zenity", "--question", f"--title={title}", f"--text={message}"],
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def prompt_yes_no_tk_subprocess(message: str, title: str, default_yes: bool = False) -> bool | None:
+    script = (
+        "import sys\n"
+        "try:\n"
+        "    import tkinter as tk\n"
+        "    from tkinter import messagebox\n"
+        "except Exception:\n"
+        "    raise SystemExit(2)\n"
+        "root = tk.Tk()\n"
+        "root.withdraw()\n"
+        "try:\n"
+        "    root.attributes('-topmost', True)\n"
+        "except Exception:\n"
+        "    pass\n"
+        "result = messagebox.askyesno(sys.argv[1], sys.argv[2], default=sys.argv[3])\n"
+        "root.destroy()\n"
+        "raise SystemExit(0 if result else 1)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, title, message, "yes" if default_yes else "no"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    return None
+
+
+def prompt_yes_no_gui(message: str, title: str, default_yes: bool = False) -> bool | None:
+    if os.name == "nt":
+        return prompt_yes_no_windows(message, title, default_yes=default_yes)
+
+    system_name = platform.system().lower()
+    if system_name == "darwin":
+        result = prompt_yes_no_macos(message, title, default_yes=default_yes)
+        if result is not None:
+            return result
+    if system_name == "linux":
+        result = prompt_yes_no_linux(message, title)
+        if result is not None:
+            return result
+    return prompt_yes_no_tk_subprocess(message, title, default_yes=default_yes)
+
+
 def prompt_device_auto_approval(args: argparse.Namespace, source: Device, device_alias: str) -> bool:
     message = (
         "New device detected.\n\n"
@@ -1340,8 +2084,10 @@ def prompt_device_auto_approval(args: argparse.Namespace, source: Device, device
         "If approved, this connection will process now."
     )
 
-    if args.tray and os.name == "nt":
-        return prompt_yes_no_windows(message, "FAQ Notes Tool", default_yes=False)
+    if args.tray:
+        gui_result = prompt_yes_no_gui(message, "FAQ Notes Tool", default_yes=False)
+        if gui_result is not None:
+            return gui_result
 
     log_status("warning", f"New device detected (approval required): {source.name}", leading_blank=True)
     log_detail("Device ID", f"{source.device_id} ({device_alias})")
@@ -1355,7 +2101,12 @@ def prompt_device_auto_approval(args: argparse.Namespace, source: Device, device
     return False
 
 
-def should_process_in_watch_mode(args: argparse.Namespace, source: Device) -> bool:
+def should_process_in_watch_mode(
+    args: argparse.Namespace,
+    source: Device,
+    *,
+    prompt_if_needed: bool = True,
+) -> bool:
     archive_root = resolve_archive_root(args.archive_root)
     archive_root, manifest_path = make_archive_paths(archive_root)
     store = create_manifest_store(args, manifest_path)
@@ -1372,6 +2123,10 @@ def should_process_in_watch_mode(args: argparse.Namespace, source: Device) -> bo
         save_manifest(store, manifest)
         return True
 
+    if not prompt_if_needed:
+        save_manifest(store, manifest)
+        return False
+
     approved = prompt_device_auto_approval(args, source, device_alias)
     device_meta["auto_approved"] = approved
     if approved:
@@ -1384,6 +2139,8 @@ def should_process_in_watch_mode(args: argparse.Namespace, source: Device) -> bo
 
 
 def notify_complete() -> None:
+    if APP_RUNTIME.tray_controller is not None:
+        return
     if os.name == "nt":
         try:
             import winsound
@@ -1392,7 +2149,8 @@ def notify_complete() -> None:
             return
         except Exception:
             pass
-    print("\a", end="", flush=True)
+    if not APP_RUNTIME.quiet:
+        print("\a", end="", flush=True)
 
 
 def process_source(args: argparse.Namespace, source: Device) -> int:
@@ -1409,7 +2167,10 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
     fast_index: dict[str, str] = manifest.setdefault("fast_index", {})
     source_quick: dict[str, str] = quick_index_root.setdefault(source.device_id, {})
     device_alias = get_or_create_device_alias(manifest, source.device_id, source.name)
+    tray = APP_RUNTIME.tray_controller
 
+    if tray is not None:
+        tray.update_status(status_text="Scanning", last_event=f"Starting ingest from {source.name}")
     log_status("info", f"Starting ingest from {source.path}", leading_blank=True)
     log_detail("Device ID", f"{source.device_id} ({device_alias})")
     log_detail("Duplicate mode", args.dedupe_mode)
@@ -1493,9 +2254,12 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
             if needs_copy:
                 copy_file_atomic(media_file, target_path, expected_size=stat.st_size)
         except OSError as exc:
-            source_disconnected = True
-            disconnect_reason = str(convert_source_io_error(source, media_file, exc))
-            break
+            if is_disconnect_error(exc) or not source.path.exists():
+                source_disconnected = True
+                disconnect_reason = str(convert_source_io_error(source, media_file, exc))
+                break
+            log_status("error", f"Failed to copy {media_file.name}: {exc}")
+            continue
         except Exception as exc:
             if "Incomplete copy" in str(exc) or not source.path.exists():
                 source_disconnected = True
@@ -1528,118 +2292,163 @@ def process_source(args: argparse.Namespace, source: Device) -> int:
 
     log_status("info", f"New files to process: {len(new_items)}")
     if not new_items:
+        if tray is not None:
+            summary = f"No new files found on {source.name}."
+            tray.update_status(last_event=summary, last_scan=summary)
         return 0
 
     if not args.yes and not args.watch and not prompt_yes_no("Copy and transcribe new files?"):
         log_status("warning", "Cancelled by user.")
         return 0
 
+    if tray is not None:
+        tray.begin_activity()
+        if tray.preferences.notify_on_import_start:
+            tray.notify(
+                "FAQ Notes Tool",
+                f"Import started for {source.name}: {len(new_items)} new file(s).",
+            )
+
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
+        if tray is not None:
+            tray.end_activity()
         raise SystemExit("OPENAI_API_KEY is not set.")
-
-    requested_workers = max(1, args.workers)
-    worker_count = min(requested_workers, len(new_items))
-    log_status(
-        "info",
-        f"Queued {len(new_items)} file(s) for transcription with {worker_count} worker(s).",
-    )
 
     processed = 0
     failed = 0
     touched_months: set[str] = set()
+    try:
+        requested_workers = max(1, args.workers)
+        worker_count = min(requested_workers, len(new_items))
+        log_status(
+            "info",
+            f"Queued {len(new_items)} file(s) for transcription with {worker_count} worker(s).",
+        )
 
-    with ThreadPoolExecutor(max_workers=worker_count) as pool:
-        futures = {
-            pool.submit(transcribe_media_file_with_api_key, api_key, item["target_path"]): item
-            for item in new_items
-        }
-
-        for index, future in enumerate(as_completed(futures), start=1):
-            item = futures[future]
-            target_path: Path = item["target_path"]
-            log_status(
-                "success",
-                f"[{index}/{len(new_items)}] Finished task for {target_path.name}",
-                leading_blank=True,
-            )
-            try:
-                transcript = future.result()
-            except Exception as exc:
-                failed += 1
-                log_status("error", f"Failed {target_path.name}: {exc}")
-                continue
-
-            captured_at: datetime = item["captured_at"]
-            month_key: str = item["month_key"]
-            month_dir: Path = item["month_dir"]
-            source_file: Path = item["source_file"]
-            content_id: str = item["content_id"]
-            fast_fingerprint: str = item["fast_fingerprint"]
-
-            transcript_dir = month_dir / "transcripts"
-            transcript_dir.mkdir(parents=True, exist_ok=True)
-            token = hashlib.blake2s(content_id.encode("utf-8"), digest_size=4).hexdigest()
-            transcript_path = transcript_dir / f"{captured_at.strftime('%Y%m%d_%H%M%S')}_{token}.txt"
-            try:
-                atomic_write_text(transcript_path, transcript.strip(), encoding="utf-8")
-            except OSError as exc:
-                failed += 1
-                log_status("error", f"Failed to write transcript {transcript_path.name}: {exc}")
-                continue
-
-            known_hashes[content_id] = {
-                "source_id": source.device_id,
-                "source_name": source.name,
-                "device_alias": device_alias,
-                "source_path": str(source_file),
-                "copied_path": path_for_manifest(archive_root, target_path),
-                "transcript_path": path_for_manifest(archive_root, transcript_path),
-                "captured_at_local": captured_at.isoformat(timespec="seconds"),
-                "processed_at_local": datetime.now().isoformat(timespec="seconds"),
-                "month_key": month_key,
-                "content_id": content_id,
-                "dedupe_mode": args.dedupe_mode,
-                "fast_fingerprint": fast_fingerprint,
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            futures = {
+                pool.submit(transcribe_media_file_with_api_key, api_key, item["target_path"]): item
+                for item in new_items
             }
-            if fast_fingerprint:
-                fast_index[fast_fingerprint] = content_id
-            manifest["files"] = known_hashes
-            manifest["fast_index"] = fast_index
-            save_manifest(store, manifest)
-            touched_months.add(month_key)
-            processed += 1
 
-    for month_key in sorted(touched_months):
-        rebuild_month_outputs(archive_root, manifest, month_key)
+            for index, future in enumerate(as_completed(futures), start=1):
+                item = futures[future]
+                target_path: Path = item["target_path"]
+                try:
+                    transcript = future.result()
+                except Exception as exc:
+                    failed += 1
+                    log_status("error", f"Failed {target_path.name}: {exc}")
+                    continue
+                log_status(
+                    "success",
+                    f"[{index}/{len(new_items)}] Finished task for {target_path.name}",
+                    leading_blank=True,
+                )
 
-    log_status(
-        "success",
-        f"Completed ingest. Processed {processed} new file(s). Failed {failed} file(s).",
-        leading_blank=True,
-    )
+                captured_at: datetime = item["captured_at"]
+                month_key: str = item["month_key"]
+                month_dir: Path = item["month_dir"]
+                source_file: Path = item["source_file"]
+                content_id: str = item["content_id"]
+                fast_fingerprint: str = item["fast_fingerprint"]
+
+                transcript_dir = month_dir / "transcripts"
+                transcript_dir.mkdir(parents=True, exist_ok=True)
+                token = hashlib.blake2s(content_id.encode("utf-8"), digest_size=4).hexdigest()
+                transcript_path = transcript_dir / f"{captured_at.strftime('%Y%m%d_%H%M%S')}_{token}.txt"
+                try:
+                    atomic_write_text(transcript_path, transcript.strip(), encoding="utf-8")
+                except OSError as exc:
+                    failed += 1
+                    log_status("error", f"Failed to write transcript {transcript_path.name}: {exc}")
+                    continue
+
+                known_hashes[content_id] = {
+                    "source_id": source.device_id,
+                    "source_name": source.name,
+                    "device_alias": device_alias,
+                    "source_path": str(source_file),
+                    "copied_path": path_for_manifest(archive_root, target_path),
+                    "transcript_path": path_for_manifest(archive_root, transcript_path),
+                    "captured_at_local": captured_at.isoformat(timespec="seconds"),
+                    "processed_at_local": datetime.now().isoformat(timespec="seconds"),
+                    "month_key": month_key,
+                    "content_id": content_id,
+                    "dedupe_mode": args.dedupe_mode,
+                    "fast_fingerprint": fast_fingerprint,
+                }
+                if fast_fingerprint:
+                    fast_index[fast_fingerprint] = content_id
+                manifest["files"] = known_hashes
+                manifest["fast_index"] = fast_index
+                save_manifest(store, manifest)
+                touched_months.add(month_key)
+                processed += 1
+
+        for month_key in sorted(touched_months):
+            rebuild_month_outputs(archive_root, manifest, month_key)
+    finally:
+        if tray is not None:
+            tray.end_activity()
+
+    summary = f"Completed ingest. Processed {processed} new file(s). Failed {failed} file(s)."
+    log_status("success", summary, leading_blank=True)
+    if tray is not None:
+        tray.update_status(last_event=summary, last_scan=summary)
+        if tray.preferences.notify_on_import_complete:
+            tray.notify("FAQ Notes Tool", f"{source.name}: {summary}")
     notify_complete()
     return processed
 
 
-def poll_watch_cycle(args: argparse.Namespace, seen_ids: set[str]) -> set[str]:
+def process_discovered_devices(
+    args: argparse.Namespace,
+    seen_ids: set[str],
+    *,
+    include_existing_approved: bool = False,
+    prompt_for_new: bool = True,
+) -> tuple[set[str], int]:
     current = discover_devices()
-    current_ids = {d.device_id for d in current}
-    new_devices = [d for d in current if d.device_id not in seen_ids]
-    for device in new_devices:
-        log_status("info", f"Detected new device: {device.name}", leading_blank=True)
+    current_ids = {device.device_id for device in current}
+    processed_total = 0
+
+    for device in current:
+        is_new_device = device.device_id not in seen_ids
+        if not is_new_device and not include_existing_approved:
+            continue
+
+        if is_new_device:
+            log_status("info", f"Detected device: {device.name}", leading_blank=True)
+        else:
+            log_status("info", f"Checking attached approved device: {device.name}", leading_blank=True)
+
         try:
-            if should_process_in_watch_mode(args, device):
-                process_source(args, device)
+            if should_process_in_watch_mode(args, device, prompt_if_needed=prompt_for_new):
+                processed_total += process_source(args, device)
         except Exception as exc:
             log_status("error", f"Error processing {device.path}: {exc}")
+
+    return current_ids, processed_total
+
+
+def poll_watch_cycle(args: argparse.Namespace, seen_ids: set[str]) -> set[str]:
+    current_ids, _ = process_discovered_devices(args, seen_ids, prompt_for_new=True)
     return current_ids
 
 
 def run_watch_mode(args: argparse.Namespace, stop_event: threading.Event | None = None) -> None:
     log_status("success", "Watch mode enabled.")
     log_status("info", "Waiting for newly connected devices. Press Ctrl+C to stop.")
-    seen_ids = {d.device_id for d in discover_devices()}
+    seen_ids, startup_processed = process_discovered_devices(
+        args,
+        set(),
+        include_existing_approved=True,
+        prompt_for_new=False,
+    )
+    if startup_processed:
+        log_status("success", f"Processed {startup_processed} new file(s) from attached approved devices on startup.")
     interval = max(2, args.interval)
 
     while True:
@@ -1650,48 +2459,139 @@ def run_watch_mode(args: argparse.Namespace, stop_event: threading.Event | None 
         seen_ids = poll_watch_cycle(args, seen_ids)
 
 
-def build_tray_image() -> Any:
+def build_tray_image(mode: str = "monitoring", frame_index: int = 0) -> Any:
     from PIL import Image, ImageDraw
 
-    image = Image.new("RGB", (64, 64), "#0f3a2e")
+    palettes = {
+        "monitoring": {"bg": "#0e5a46", "panel": "#dff6ef", "ink": "#0e5a46", "accent": "#8ff0c6"},
+        "paused": {"bg": "#9a6a00", "panel": "#fff0c7", "ink": "#7a5200", "accent": "#ffd166"},
+        "restarting": {"bg": "#8e2f1f", "panel": "#ffe3db", "ink": "#8e2f1f", "accent": "#ff8f70"},
+        "update_pending": {"bg": "#5b3f9b", "panel": "#efe6ff", "ink": "#5b3f9b", "accent": "#b89cff"},
+        "active": {"bg": "#0f4c81", "panel": "#e6f4ff", "ink": "#0f4c81", "accent": "#5ad1ff"},
+    }
+    palette = palettes.get(mode, palettes["monitoring"])
+
+    image = Image.new("RGB", (64, 64), palette["bg"])
     draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((6, 6, 58, 58), radius=12, fill="#1a5e49")
-    draw.rectangle((18, 14, 46, 50), fill="#d9f3e8")
-    draw.rectangle((22, 20, 42, 26), fill="#1a5e49")
-    draw.rectangle((22, 30, 42, 36), fill="#1a5e49")
-    draw.rectangle((22, 40, 34, 46), fill="#1a5e49")
+    draw.rounded_rectangle((5, 5, 59, 59), radius=14, fill=palette["bg"])
+    draw.rounded_rectangle((12, 10, 44, 54), radius=6, fill=palette["panel"])
+    draw.rectangle((19, 18, 37, 23), fill=palette["ink"])
+    draw.rectangle((19, 29, 37, 34), fill=palette["ink"])
+    draw.rectangle((19, 40, 31, 45), fill=palette["ink"])
+
+    if mode == "monitoring":
+        draw.ellipse((46, 16, 56, 26), fill=palette["accent"])
+        draw.ellipse((49, 19, 53, 23), fill="#ffffff")
+    elif mode == "paused":
+        draw.rounded_rectangle((46, 15, 56, 47), radius=5, fill=palette["accent"])
+        draw.rectangle((49, 21, 51, 41), fill=palette["ink"])
+        draw.rectangle((53, 21, 55, 41), fill=palette["ink"])
+    elif mode == "restarting":
+        draw.arc((44, 14, 58, 28), start=20, end=220, fill=palette["accent"], width=4)
+        draw.arc((42, 30, 56, 44), start=200, end=20, fill=palette["accent"], width=4)
+        draw.polygon([(54, 16), (58, 16), (56, 22)], fill=palette["accent"])
+        draw.polygon([(42, 42), (46, 42), (44, 36)], fill=palette["accent"])
+    elif mode == "update_pending":
+        draw.rounded_rectangle((46, 15, 56, 47), radius=5, fill=palette["accent"])
+        draw.rectangle((50, 20, 52, 35), fill="#ffffff")
+        draw.rectangle((50, 39, 52, 42), fill="#ffffff")
+    elif mode == "active":
+        dot_positions = [(50, 14), (56, 20), (58, 28), (56, 36), (50, 42), (42, 46), (34, 48), (26, 46), (18, 42), (12, 36), (10, 28), (12, 20)]
+        active_index = frame_index % len(dot_positions)
+        for idx, (x, y) in enumerate(dot_positions):
+            if idx == active_index:
+                color = "#ffffff"
+                radius = 4
+            elif idx == (active_index - 1) % len(dot_positions):
+                color = palette["accent"]
+                radius = 3
+            else:
+                color = "#1d6ea8"
+                radius = 2
+            draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color)
+        draw.rounded_rectangle((18, 18, 38, 46), radius=5, outline=palette["accent"], width=3)
     return image
 
 
 def run_tray_mode(args: argparse.Namespace) -> None:
-    if os.name != "nt":
-        raise SystemExit("--tray is currently supported on Windows only.")
     try:
         import pystray
     except ImportError as exc:
         raise SystemExit("Tray mode requires 'pystray' and 'Pillow'. Install with: pip install pystray pillow") from exc
 
-    log_status("success", "Tray mode enabled.")
-    log_status("info", "The app is running in the system tray.")
-    stop_event = threading.Event()
-    watch_thread = threading.Thread(target=run_watch_mode, args=(args, stop_event), daemon=True)
-    watch_thread.start()
+    archive_root = resolve_archive_root(args.archive_root)
+    archive_root, _ = make_archive_paths(archive_root)
+    controller = TrayController(
+        args=args,
+        archive_root=archive_root,
+        preferences=load_tray_preferences(archive_root),
+    )
+    APP_RUNTIME.tray_controller = controller
 
-    def on_quit(icon: Any, item: Any) -> None:
-        stop_event.set()
-        icon.stop()
+    watch_thread = threading.Thread(target=controller.run_watch_loop, daemon=True)
+    watch_thread.start()
+    has_menu = bool(getattr(pystray.Icon, "HAS_MENU", True))
+    if not has_menu:
+        log_status("warning", "Tray backend does not support menus on this platform/backend.")
+
+    advanced_menu = pystray.Menu(
+        pystray.MenuItem(
+            "Notify on import start",
+            controller.toggle_notify_on_import_start,
+            checked=lambda item: controller.preferences.notify_on_import_start,
+        ),
+        pystray.MenuItem(
+            "Notify on import complete",
+            controller.toggle_notify_on_import_complete,
+            checked=lambda item: controller.preferences.notify_on_import_complete,
+        ),
+        pystray.MenuItem(
+            lambda item: f"Last event: {controller.snapshot()[1]}",
+            None,
+            enabled=False,
+        ),
+        pystray.MenuItem(
+            lambda item: f"Last scan: {controller.snapshot()[2]}",
+            None,
+            enabled=False,
+        ),
+        pystray.MenuItem("Open archive folder", controller.open_archive_folder),
+        pystray.MenuItem("Open log file", controller.open_log_file),
+    )
+
+    menu = pystray.Menu(
+        pystray.MenuItem(
+            lambda item: f"Status: {controller.snapshot()[0]}",
+            None,
+            enabled=False,
+        ),
+        pystray.MenuItem(
+            lambda item: "Resume monitoring" if controller.snapshot()[3] else "Pause monitoring",
+            controller.toggle_paused,
+        ),
+        pystray.MenuItem("Scan attached devices now", controller.scan_now),
+        pystray.MenuItem("Restart service", controller.restart_service),
+        pystray.MenuItem("Advanced", advanced_menu),
+        pystray.MenuItem("Quit", controller.on_quit),
+    )
 
     icon = pystray.Icon(
         "faq_notes_ingest",
         build_tray_image(),
         "FAQ Notes Tool",
-        pystray.Menu(pystray.MenuItem("Quit", on_quit)),
+        menu if has_menu else menu,
     )
+    controller.bind_icon(icon)
     try:
         icon.run()
     finally:
-        stop_event.set()
+        controller.stop_event.set()
         watch_thread.join(timeout=max(2, args.interval) + 2)
+        restart_requested = controller.restart_requested
+        relaunch_scheduled = controller.relaunch_scheduled
+        APP_RUNTIME.tray_controller = None
+        if restart_requested and not relaunch_scheduled:
+            relaunch_tray_process(args)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1721,7 +2621,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tray",
         action="store_true",
-        help="Windows system tray mode (watch mode with first-time device approval prompts).",
+        help="System tray mode (watch mode with first-time device approval prompts).",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress console logging (useful for tray/background runs).",
+    )
+    parser.add_argument(
+        "--log-file",
+        help="Optional log file path. Tray mode defaults to archive_root/faq_notes.log.",
+    )
+    parser.add_argument(
+        "--install-startup",
+        action="store_true",
+        help="Install a per-user startup launcher that runs tray mode at sign-in.",
+    )
+    parser.add_argument(
+        "--remove-startup",
+        action="store_true",
+        help="Remove the per-user startup launcher created by --install-startup.",
     )
     parser.add_argument(
         "--interval",
@@ -1785,6 +2704,20 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     configure_console_output(args.no_color)
+    configure_runtime(args)
+    if args.install_startup and args.remove_startup:
+        raise SystemExit("Choose either --install-startup or --remove-startup, not both.")
+    if args.install_startup:
+        launcher_path = install_startup_launcher(args)
+        log_status("success", f"Installed startup launcher at {launcher_path}")
+        return
+    if args.remove_startup:
+        removed = remove_startup_launcher()
+        if removed:
+            log_status("success", "Removed startup launcher.")
+        else:
+            log_status("warning", "Startup launcher was not installed.")
+        return
     if args.migrate_only and not args.migrate_manifest:
         raise SystemExit("--migrate-only requires --migrate-manifest.")
     if args.migrate_manifest:

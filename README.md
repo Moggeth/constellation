@@ -31,7 +31,7 @@ python constellation.py codex status
 python constellation.py toolbelt list
 ```
 
-Fresh-thread guidance for future Codex work in this repo lives in [AGENTS.md](C:\Users\mog\OneDrive\Documents\Coding\Personal\Python\things_are_different_now\constellation\AGENTS.md).
+Fresh-thread guidance for future Codex work in this repo lives in [AGENTS.md](AGENTS.md).
 
 ## What it does
 
@@ -72,6 +72,18 @@ or install from requirements:
 
 ```bash
 pip install -r requirements.txt
+```
+
+For a fresh Windows machine, the quickest setup path is:
+
+```powershell
+pwsh -File .\bootstrap.ps1
+```
+
+To also mount an external read-only library root on that machine:
+
+```powershell
+pwsh -File .\bootstrap.ps1 -MountLibrary "C:\path\to\older\repos"
 ```
 
 For tray mode:
@@ -165,6 +177,20 @@ Disable that logging if needed:
 python voice_notes_realtime.py --no-session-logging
 ```
 
+When you want to review the most recent voice session, inspect:
+
+- `toolbelt/realtime_sessions/<timestamp>/transcript.md` for the user/assistant exchange
+- `toolbelt/realtime_sessions/<timestamp>/events.jsonl` for tool calls, timings, errors, and reconnects
+- `toolbelt/realtime_voice.log` for tray-level session startup/shutdown context
+
+In Constellation terms, "review the logs", "introspect on the last session", or "self-reflect on the last session" should mean:
+
+- look at the latest session folder first
+- check the transcript tail to see what the user was trying to do
+- check timestamps on tool starts/completions
+- identify failed tool calls, abandoned actions, runtime errors, and slow operations
+- summarize what went wrong and implement fixes when the user asks for improvements
+
 Notes on realtime voices:
 
 - Supported realtime voices are currently `alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`, `shimmer`, `verse`, `marin`, and `cedar`.
@@ -172,6 +198,37 @@ Notes on realtime voices:
 - Voice changes now carry forward recent conversation context instead of starting from a blank slate.
 - The live runtime now uses UTF-8-safe console output on Windows so transcribed characters do not crash the session.
 - Tray mode remembers the default voice, can relaunch the live session without a terminal window, and uses a Constellation-themed starry tray icon.
+- Speech speed is clamped to the current realtime-supported range before session updates are sent.
+
+## Workspace Boundaries
+
+Constellation now treats this repo as the canonical app home:
+
+- Default writable workspace root: `workspace/`
+- Optional mounted library roots: zero or more external folders exposed as read-only local context
+- Local direct-write tools should stay in `workspace/`
+- Mounted libraries stay readable and openable locally
+- If you want to modify a mounted repo, target it explicitly through Codex
+
+Machine-specific runtime paths live in `toolbelt/runtime_paths.json`, which is intentionally not tracked by Git. The checked-in example lives at `toolbelt/runtime_paths.example.json`.
+
+Show the active runtime paths:
+
+```bash
+python constellation.py paths show
+```
+
+Mount an external read-only library root:
+
+```bash
+python constellation.py paths mount-library "C:\path\to\older\repos"
+```
+
+Reset to the default repo-local workspace with no mounted libraries:
+
+```bash
+python constellation.py paths reset
+```
 
 Check Codex bridge status:
 

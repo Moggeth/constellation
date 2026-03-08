@@ -5,7 +5,11 @@ __pycache__/
 # Generated personal archive/output data
 faq_notes/*
 !faq_notes/.gitkeep
+workspace/*
+!workspace/.gitkeep
+!workspace/README.md
 toolbelt/codex_runs/
+toolbelt/runtime_paths.json
 toolbelt/realtime_tray_settings.json
 toolbelt/realtime_voice.log
 toolbelt/realtime_sessions/
